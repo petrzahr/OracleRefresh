@@ -1,3 +1,6 @@
+﻿#requires -Version 5.1
 $ErrorActionPreference = 'Stop'
-& python "$PSScriptRoot/config_data.py" capture
-if ($LASTEXITCODE -ne 0) { throw 'Capture failed; do not refresh the database.' }
+try {
+    . "$PSScriptRoot/OracleRefresh.ps1"
+    Invoke-OrfAction -Action capture
+} catch { Write-Error ("CAPTURE FAILED: " + $_.Exception.Message) -ErrorAction Continue; exit 1 }

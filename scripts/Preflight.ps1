@@ -1,4 +1,7 @@
+﻿#requires -Version 5.1
 param([Parameter(Mandatory=$true)][string]$Snapshot)
 $ErrorActionPreference = 'Stop'
-& python "$PSScriptRoot/config_data.py" preflight --snapshot $Snapshot
-if ($LASTEXITCODE -ne 0) { throw 'Preflight failed; do not run restore.' }
+try {
+    . "$PSScriptRoot/OracleRefresh.ps1"
+    Invoke-OrfAction -Action preflight -Snapshot $Snapshot
+} catch { Write-Error ("PREFLIGHT FAILED: " + $_.Exception.Message) -ErrorAction Continue; exit 1 }
