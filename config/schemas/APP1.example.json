@@ -1,0 +1,32 @@
+{
+  "steps": [
+    {
+      "type": "restoreRows",
+      "table": "CONFIG_SELECTED",
+      "key": ["ID", "CONFIG_KEY"],
+      "columns": ["CONFIG_VALUE", "DESCRIPTIONS"],
+      "keyValues": [[101, "API_URL"], [102, "ENVIRONMENT"]],
+      "expectedRows": 2
+    },
+    {
+      "type": "restoreRows",
+      "table": "CONFIG_ALL",
+      "key": ["ID", "CONFIG_KEY"],
+      "columns": ["CONFIG_VALUE", "DESCRIPTIONS"],
+      "allRows": true
+    },
+    {
+      "type": "replaceTable",
+      "table": "LOOKUP",
+      "maxRows": 10000
+    },
+    {
+      "type": "delete",
+      "table": "TEMP_MESSAGES",
+      "match": {
+        "SOURCE": "PROD",
+        "STATUS": "PENDING"
+      }
+    }
+  ]
+}

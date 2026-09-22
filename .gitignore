@@ -1,0 +1,15 @@
+/config/database.json
+/config/credentials.json
+/config/schemas/*.json
+!/config/schemas/*.example.json
+/snapshots/*
+!/snapshots/.gitkeep
+/logs/*
+!/logs/.gitkeep
+/snapshots/
+/logs/
+__pycache__/
+*.pyc
+*.log
+.env
+.env.*

@@ -1,0 +1,5 @@
+{
+  "tnsAlias": "TESTDB",
+  "sqlplusPath": "sqlplus.exe",
+  "schemaOrder": ["APP1", "APP2", "CT"]
+}
