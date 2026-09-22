@@ -6,10 +6,3 @@
 !/snapshots/.gitkeep
 /logs/*
 !/logs/.gitkeep
-/snapshots/
-/logs/
-__pycache__/
-*.pyc
-*.log
-.env
-.env.*

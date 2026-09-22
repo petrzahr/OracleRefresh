@@ -14,10 +14,22 @@ Step types:
 | --- | --- | --- |
 | `restoreRows` | `table`, `key`, `columns`, plus `keyValues` or `allRows: true` | Captures current TEST values and updates only specified columns for the selected rows. With `allRows`, every captured row is matched using the non-null, unique key. Optional `expectedRows` applies only to `keyValues`. |
 | `replaceTable` | `table` | Captures every row, truncates the table and inserts all captured rows. Optional `maxRows` / `expectedRows`. |
-| `update` | `table`, `match`, `set` | Fixed post-refresh UPDATE. All entries in `match` use AND; each entry in `set` names a column to change. `expectedRows` optionally requires an exact affected count; otherwise at least one row must be affected. |
+| `update` | `table`, `set`; optional `match` | Fixed post-refresh UPDATE. All entries in `match` use AND; omitting `match` updates every row in the table. Each entry in `set` names a column to change. `expectedRows` optionally requires an exact affected count; without it, a filtered UPDATE requires at least one row, while an update of the entire table also accepts zero rows. |
 | `delete` | `table`, `match` | Fixed post-refresh DELETE for all rows matching the AND conditions. Zero affected rows is allowed. |
 
 `match` values are exact equality tests; JSON `null` means SQL `IS NULL`. There is no free-form SQL or OR operator. Multiple `update` or `delete` steps for the same table can use different match conditions. Keep their selectors disjoint when the final validation needs to check each result. A table configured as `restoreRows` or `replaceTable` cannot also use fixed `update` or `delete`; fixed `update` and `delete` may share a table if the delete does not remove rows needed for update validation.
+
+To set the same value in every row of `CONFIG`, use a step without `match`:
+
+```json
+{
+  "type": "update",
+  "table": "CONFIG",
+  "set": {"CONFIG_VALUE": "https://api-test.example.cz"}
+}
+```
+
+The entire table is exported to CSV and INSERT SQL during capture. Validation checks that every row still present in the table has the configured value; with `expectedRows`, it also checks the final row count. Avoid subsequent steps that change this column unless they leave the same final value.
 
 **Execution order:** All destinations are checked first. Every `replaceTable` is then **truncated in reverse order** of the `schemaOrder`/`steps` traversal (children before parents). Next, schemas run in `schemaOrder` and each schema's steps run from top to bottom. At a `replaceTable` step, the previously truncated table is inserted (parents before children). This keeps the required reverse TRUNCATE/forward INSERT order across schemas. Oracle may still prohibit `TRUNCATE` on a referenced parent with an enabled foreign key; arrange DBA constraint handling or use a separate DELETE approach if needed. TRUNCATE commits immediately; a later failure can leave tables empty or partially restored. Preserve the snapshot and rerun after resolving the cause.
 

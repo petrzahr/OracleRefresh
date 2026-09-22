@@ -93,9 +93,9 @@ def load_config():
             if 'backupMaxRows' in update and (not isinstance(update['backupMaxRows'], int) or isinstance(update['backupMaxRows'], bool) or update['backupMaxRows'] < 0):
                 fail(f'{user}.{update["table"]}: invalid backupMaxRows')
             match, values = update.get('match'), update.get('set')
-            if not isinstance(match, dict) or not match or not isinstance(values, dict) or not values:
-                fail(f'{user}.{update["table"]}: UPDATE requires nonempty match and set objects')
-            for name, mapping in (('match', match), ('set', values)):
+            if ('match' in update and (not isinstance(match, dict) or not match)) or not isinstance(values, dict) or not values:
+                fail(f'{user}.{update["table"]}: UPDATE requires a nonempty set and, when present, a nonempty match object')
+            for name, mapping in (('match', match or {}), ('set', values)):
                 for col, value in mapping.items():
                     identifier(col)
                     if value is not None and (not isinstance(value, (str, int, float)) or isinstance(value, bool)):
@@ -394,7 +394,7 @@ def capture(db, schemas):
             for update in cfg.get('updates', []):
                 table = identifier(update['table'])
                 types = full_metadata(db, cfg, table)
-                match = {identifier(k): v for k, v in update['match'].items()}
+                match = {identifier(k): v for k, v in update.get('match', {}).items()}
                 values = {identifier(k): v for k, v in update['set'].items()}
                 if not set(match) | set(values) <= set(types):
                     fail(f'{user}.{table}: UPDATE column missing')
@@ -467,7 +467,7 @@ def read_snapshot(path, db, schemas):
             if deletion['table'] != identifier(current['table']) or deletion['match'] != {identifier(k): v for k, v in current['match'].items()} or deletion.get('backupMaxRows') != current.get('backupMaxRows'):
                 fail('Delete configuration changed since capture')
         for update, current in zip(recorded.get('updates', []), cfg.get('updates', [])):
-            if update['table'] != identifier(current['table']) or update['match'] != {identifier(k): v for k, v in current['match'].items()} or update['set'] != {identifier(k): v for k, v in current['set'].items()} or update['expectedRows'] != current.get('expectedRows') or update.get('backupMaxRows') != current.get('backupMaxRows'):
+            if update['table'] != identifier(current['table']) or update['match'] != {identifier(k): v for k, v in current.get('match', {}).items()} or update['set'] != {identifier(k): v for k, v in current['set'].items()} or update['expectedRows'] != current.get('expectedRows') or update.get('backupMaxRows') != current.get('backupMaxRows'):
                 fail('Fixed UPDATE configuration changed since capture')
     return snap
 
@@ -520,12 +520,15 @@ def restore(db, schemas, snap):
                     sqlplus(db, cfg, f'SET DEFINE OFF\n{inserts}\nCOMMIT;\n')
                 print(f'{name}: inserted {len(rows)} rows')
             elif kind == 'update':
-                clause = delete_predicate(item['match'], item['types'])
+                clause = f" WHERE {delete_predicate(item['match'], item['types'])}" if item['match'] else ''
                 assignments = ', '.join(f'{col} = {literal(value, item["types"][col])}' for col, value in item['set'].items())
                 expected = item['expectedRows']
-                check = f'IF SQL%ROWCOUNT != {expected} THEN' if expected is not None else 'IF SQL%ROWCOUNT = 0 THEN'
-                sql = (f'BEGIN UPDATE {item["table"]} SET {assignments} WHERE {clause};\n'
-                       f'{check} RAISE_APPLICATION_ERROR(-20006, {quoted(name + ": unexpected UPDATE row count")}); END IF;\n'
+                check = (f'IF SQL%ROWCOUNT != {expected} THEN RAISE_APPLICATION_ERROR(-20006, {quoted(name + ": unexpected UPDATE row count")}); END IF;\n'
+                         if expected is not None else
+                         f'IF SQL%ROWCOUNT = 0 THEN RAISE_APPLICATION_ERROR(-20006, {quoted(name + ": unexpected UPDATE row count")}); END IF;\n'
+                         if item['match'] else '')
+                sql = (f'BEGIN UPDATE {item["table"]} SET {assignments}{clause};\n'
+                       f'{check}'
                        'COMMIT; EXCEPTION WHEN OTHERS THEN ROLLBACK; RAISE; END;\n/\n')
                 sqlplus(db, cfg, sql)
                 print(f'{name}: fixed UPDATE applied')
@@ -560,12 +563,12 @@ def validate(db, schemas, snap):
                 fail(f'{entry["username"]}.{deletion["table"]}: matching rows remain')
             print(f'{entry["username"]}.{deletion["table"]}: delete validated')
         for update in entry.get('updates', []):
-            clause = delete_predicate(update['match'], update['types'])
+            clause = f" WHERE {delete_predicate(update['match'], update['types'])}" if update['match'] else ''
             overlap = set(update['match']) & set(update['set'])
             if overlap:
                 stable_match = {k: v for k, v in update['match'].items() if k not in overlap}
                 new_match = {**stable_match, **update['set']}
-                old_sql = f"SELECT 'UPDATE_OLD|' || COUNT(*) FROM {update['table']} WHERE {clause};\n"
+                old_sql = f"SELECT 'UPDATE_OLD|' || COUNT(*) FROM {update['table']}{clause};\n"
                 new_sql = f"SELECT 'UPDATE_NEW|' || COUNT(*) FROM {update['table']} WHERE {delete_predicate(new_match, update['types'])};\n"
                 old_output = sqlplus(db, cfg, old_sql)
                 new_output = sqlplus(db, cfg, new_sql)
@@ -581,13 +584,13 @@ def validate(db, schemas, snap):
                                   f'({col} IS NULL OR {col} <> {literal(value, update["types"][col])})')
             sql = ("SELECT 'UPDATE_CHECK|' || COUNT(*) || '|' || "
                    f"COALESCE(SUM(CASE WHEN {' OR '.join(mismatches)} THEN 1 ELSE 0 END), 0) "
-                   f'FROM {update["table"]} WHERE {clause};\n')
+                   f'FROM {update["table"]}{clause};\n')
             output = sqlplus(db, cfg, sql)
             found = [line.strip().split('|')[1:] for line in output.splitlines() if line.strip().startswith('UPDATE_CHECK|')]
             if len(found) != 1 or len(found[0]) != 2:
                 fail(f'{entry["username"]}.{update["table"]}: validation output missing')
             count, wrong = map(int, found[0])
-            if wrong or (update['expectedRows'] is not None and count != update['expectedRows']) or (update['expectedRows'] is None and count == 0):
+            if wrong or (update['expectedRows'] is not None and count != update['expectedRows']) or (update['expectedRows'] is None and update['match'] and count == 0):
                 fail(f'{entry["username"]}.{update["table"]}: fixed UPDATE validation mismatch')
             print(f'{entry["username"]}.{update["table"]}: fixed UPDATE validated ({count} rows)')
     print('VALIDATION SUCCESS')
