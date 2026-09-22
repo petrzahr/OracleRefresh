@@ -42,7 +42,13 @@ def load_config():
         fail('credentials.json requires a users object')
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', db['tnsAlias']):
         fail('Invalid TNS alias')
-    configs = list((ROOT / 'config/schemas').glob('*.json'))
+    if not isinstance(db.get('timeoutSeconds', 300), int) or isinstance(db.get('timeoutSeconds'), bool) or db.get('timeoutSeconds', 300) <= 0:
+        fail('timeoutSeconds must be a positive integer')
+    target = db.get('expectedTarget')
+    if not isinstance(target, dict) or set(target) != {'dbUniqueName', 'serviceName', 'conName'} or any(
+            not isinstance(v, str) or not re.fullmatch(r'[A-Za-z0-9_.$#-]+', v) for v in target.values()):
+        fail('database.json requires expectedTarget: dbUniqueName, serviceName, conName')
+    configs = [p for p in (ROOT / 'config/schemas').glob('*.json') if not p.name.endswith('.example.json')]
     if not configs:
         fail('No schema JSON files found')
     by_user = {identifier(path.stem): path for path in configs}
@@ -90,20 +96,36 @@ def load_config():
                 fail(f'{user}: {kind} cannot overlap with restoreRows/replaceTable')
         for update in cfg.get('updates', []):
             identifier(update['table'])
+            keys = update.get('key')
+            if not isinstance(keys, list) or not keys or len({identifier(k) for k in keys}) != len(keys):
+                fail('Every UPDATE requires a nonempty, unique key list')
             if 'backupMaxRows' in update and (not isinstance(update['backupMaxRows'], int) or isinstance(update['backupMaxRows'], bool) or update['backupMaxRows'] < 0):
                 fail(f'{user}.{update["table"]}: invalid backupMaxRows')
             match, values = update.get('match'), update.get('set')
             if ('match' in update and (not isinstance(match, dict) or not match)) or not isinstance(values, dict) or not values:
                 fail(f'{user}.{update["table"]}: UPDATE requires a nonempty set and, when present, a nonempty match object')
             for name, mapping in (('match', match or {}), ('set', values)):
+                if len({identifier(k) for k in mapping}) != len(mapping):
+                    fail('Duplicate column after identifier normalization')
                 for col, value in mapping.items():
                     identifier(col)
                     if value is not None and (not isinstance(value, (str, int, float)) or isinstance(value, bool)):
                         fail(f'{user}.{update["table"]}: invalid {name} value')
+            if {identifier(k) for k in keys} & {identifier(k) for k in values}:
+                fail('UPDATE cannot modify its stable key')
             if 'expectedRows' in update and (not isinstance(update['expectedRows'], int) or isinstance(update['expectedRows'], bool) or update['expectedRows'] < 0):
                 fail(f'{user}.{update["table"]}: invalid expectedRows')
+        table_keys = {}
+        for update in cfg.get('updates', []):
+            table, keys = identifier(update['table']), [identifier(k) for k in update['key']]
+            if table in table_keys and table_keys[table] != keys:
+                fail('UPDATE steps for the same table must use the same stable key')
+            table_keys[table] = keys
         for deletion in cfg.get('deletes', []):
             identifier(deletion['table'])
+            limit = deletion.get('maxDeleteRows')
+            if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+                fail('Every DELETE requires a nonnegative maxDeleteRows')
             if 'backupMaxRows' in deletion and (not isinstance(deletion['backupMaxRows'], int) or isinstance(deletion['backupMaxRows'], bool) or deletion['backupMaxRows'] < 0):
                 fail(f'{user}.{deletion["table"]}: invalid backupMaxRows')
             match = deletion.get('match')
@@ -115,12 +137,17 @@ def load_config():
                 identifier(col)
         for full in cfg.get('fullTables', []):
             identifier(full['table'])
+            limit = full.get('maxDeleteRows')
+            if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+                fail('Every replaceTable requires a nonnegative maxDeleteRows for the target')
             if 'maxRows' in full and (not isinstance(full['maxRows'], int) or isinstance(full['maxRows'], bool) or full['maxRows'] < 0):
                 fail(f'{user}.{full["table"]}: invalid maxRows')
-            if 'expectedRows' in full and (not isinstance(full['expectedRows'], int) or full['expectedRows'] < 0 or ('maxRows' in full and full['expectedRows'] > full['maxRows'])):
+            if 'expectedRows' in full and (not isinstance(full['expectedRows'], int) or isinstance(full['expectedRows'], bool) or full['expectedRows'] < 0 or ('maxRows' in full and full['expectedRows'] > full['maxRows'])):
                 fail(f'{user}.{full["table"]}: invalid expectedRows')
         for obj in cfg.get('objects', []):
             identifier(obj['table'])
+            if 'expectedRows' in obj and (not isinstance(obj['expectedRows'], int) or isinstance(obj['expectedRows'], bool) or obj['expectedRows'] < 0):
+                fail('Invalid restoreRows expectedRows')
             if 'backupMaxRows' in obj and (not isinstance(obj['backupMaxRows'], int) or isinstance(obj['backupMaxRows'], bool) or obj['backupMaxRows'] < 0):
                 fail(f'{user}.{obj["table"]}: invalid backupMaxRows')
             keys = [identifier(x) for x in obj['key']]
@@ -146,21 +173,37 @@ def load_config():
         fail('Use schemaOrder and per-schema steps; remove legacy order lists')
     return db, schemas
 
+def target_guard(db, cfg):
+    fields = {'dbUniqueName': 'DB_UNIQUE_NAME', 'serviceName': 'SERVICE_NAME', 'conName': 'CON_NAME'}
+    checks = [f"NVL(UPPER(SYS_CONTEXT('USERENV', '{field}')), '?') <> {quoted(db['expectedTarget'][key].upper())}"
+              for key, field in fields.items()]
+    checks.append(f"SYS_CONTEXT('USERENV', 'SESSION_USER') <> {quoted(cfg['username'])}")
+    return ('BEGIN IF ' + ' OR '.join(checks) +
+            " THEN RAISE_APPLICATION_ERROR(-20010, 'Target database or account mismatch'); END IF; END;\n/\n")
+
+
 def sqlplus(db, cfg, script):
     exe = db.get('sqlplusPath', 'sqlplus')
     # Credentials never appear in the process command line or log. SQL*Plus reads CONNECT from stdin.
     password = cfg['password'].replace('"', '""')
     if any(c in password for c in ['\x00']):
         fail('Unsupported password character')
-    header = (f'connect {cfg["username"]}/"{password}"@{db["tnsAlias"]}\n'
-              'whenever oserror exit failure\nwhenever sqlerror exit sql.sqlcode rollback\n'
+    header = ('whenever oserror exit failure rollback\nwhenever sqlerror exit failure rollback\n'
+              'set define off echo off verify off\n'
+              f'connect {cfg["username"]}/"{password}"@{db["tnsAlias"]}\n'
               'set heading off feedback off verify off echo off define off pagesize 0 linesize 32767 trimspool on tab off\n'
-              "alter session set nls_numeric_characters='.,';\n")
-    proc = subprocess.run([exe, '-S', '/nolog'], input=header + script + '\nexit\n', text=True,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+              'set sqlblanklines on serveroutput on size unlimited format wrapped\n'
+              "alter session set nls_numeric_characters='.,';\n"
+              "alter session set nls_calendar='GREGORIAN';\n" + target_guard(db, cfg))
+    env = {**os.environ, 'NLS_LANG': '.AL32UTF8', 'ORA_NCHAR_LITERAL_REPLACE': 'TRUE'}
+    proc = subprocess.run([exe, '-L', '-S', '/nolog'], input=header + script + '\nexit rollback\n',
+                          text=True, encoding='utf-8', errors='strict', env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=db.get('timeoutSeconds', 300))
     output = proc.stdout + proc.stderr
-    if proc.returncode or re.search(r'(^|\n)(ORA-|SP2-|PLS-)\d+', output):
-        fail(f'SQL*Plus failed for {cfg["username"]}: ' + '\n'.join(output.splitlines()[-12:]))
+    errors = re.findall(r'(?m)^\s*((?:ORA-|SP2-|PLS-)\d+)', output)
+    if proc.returncode or errors:
+        # Do not echo SQL, connection text, or captured configuration values into logs.
+        fail(f'SQL*Plus failed for {cfg["username"]}: return code {proc.returncode}; errors {errors}')
     return output
 
 def metadata(db, cfg, table, names):
@@ -174,7 +217,7 @@ def metadata(db, cfg, table, names):
     return result
 
 def full_metadata(db, cfg, table):
-    q = ("SELECT 'META|' || column_name || '|' || data_type FROM user_tab_columns "
+    q = ("SELECT 'META|' || column_name || '|' || data_type FROM user_tab_cols "
          f"WHERE table_name = {quoted(table)} AND virtual_column = 'NO' "
          "AND hidden_column = 'NO' ORDER BY column_id;\n")
     lines = [line.strip()[5:].split('|', 1) for line in sqlplus(db, cfg, q).splitlines() if line.strip().startswith('META|')]
@@ -202,22 +245,47 @@ def literal(value, typ):
     if typ == 'NUMBER':
         if not re.fullmatch(r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?', str(value)):
             fail('Invalid numeric snapshot value')
-        return f"TO_NUMBER({quoted(str(value))}, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''')"
+        return str(value)
     if typ == 'DATE':
-        return f"TO_DATE({quoted(value)}, 'YYYY-MM-DD HH24:MI:SS')"
+        return f"TO_DATE({literal(value, 'VARCHAR2')}, 'FXYYYY-MM-DD HH24:MI:SS')"
     if typ == 'TIMESTAMP':
-        return f"TO_TIMESTAMP({quoted(value)}, 'YYYY-MM-DD HH24:MI:SS.FF9')"
+        return f"TO_TIMESTAMP({literal(value, 'VARCHAR2')}, 'FXYYYY-MM-DD HH24:MI:SS.FF9')"
     if typ == 'TIMESTAMP WITH TIME ZONE':
-        return f"TO_TIMESTAMP_TZ({quoted(value)}, 'YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM')"
-    return quoted(value)
+        return f"TO_TIMESTAMP_TZ({literal(value, 'VARCHAR2')}, 'FXYYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM')"
+    if not isinstance(value, str):
+        fail('Character column requires a string or null')
+    # Keep SQL*Plus control lines and blank lines out of literal input. Small
+    # chunks also avoid its input-line limit for long UTF-8 strings.
+    parts = []
+    prefix = 'N' if typ in {'NCHAR', 'NVARCHAR2'} else ''
+    for piece in re.split(r'([\r\n])', value):
+        if piece in {'\r', '\n'}:
+            parts.append(f"{'NCHR' if prefix else 'CHR'}({ord(piece)})")
+        elif piece:
+            parts.extend(prefix + quoted(piece[i:i + 200]) for i in range(0, len(piece), 200))
+    if not parts:
+        return 'NULL'
+    result = '(' + '\n || '.join(parts) + ')'
+    if len(parts) > 1 and typ in {'CHAR', 'NCHAR'}:
+        cast = f'CHAR({len(value)} CHAR)' if typ == 'CHAR' else f'NCHAR({len(value)})'
+        result = f'CAST({result} AS {cast})'
+    return result
 
 def predicate(keys, values, types):
     return ' AND '.join(f'{k} = {literal(v, types[k])}' for k, v in zip(keys, values))
 
 def delete_predicate(match, types):
-    return ' AND '.join(f'{identifier(key)} IS NULL' if value is None else
+    return ' AND '.join(f'{identifier(key)} IS NULL' if value is None or value == '' else
                         f'{identifier(key)} = {literal(value, types[identifier(key)])}'
                         for key, value in match.items())
+
+
+def captured_predicate(row, types):
+    # Compare the exported representation, including timezone offsets. Oracle
+    # timestamp equality alone would conflate equal instants with different offsets.
+    return ' AND '.join(f'{col} IS NULL' if value is None else
+                        f'{expression(col, types[col])} = {literal(value, types[col] if types[col] in {"CHAR", "VARCHAR2", "NCHAR", "NVARCHAR2"} else "VARCHAR2")}'
+                        for col, value in row.items())
 
 def query_rows(db, cfg, obj, types):
     table = identifier(obj['table'])
@@ -245,12 +313,12 @@ def query_rows(db, cfg, obj, types):
         fail(f'{cfg["username"]}.{table}: expectedRows mismatch')
     return rows
 
-def query_full_table(db, cfg, table, types, max_rows):
+def query_full_table(db, cfg, table, types, max_rows, where=None):
     fields = ', '.join(f'{quoted(n)} VALUE {expression(n, typ)}' for n, typ in types.items())
     json_expr = f'JSON_OBJECT({fields} NULL ON NULL RETURNING CLOB)'
     sql = ("set serveroutput on size unlimited\n"
            "DECLARE v_count NUMBER := 0; BEGIN\n"
-           f"FOR r IN (SELECT {json_expr} AS j FROM {table}) LOOP\n"
+           f"FOR r IN (SELECT {json_expr} AS j FROM {table}{' WHERE ' + where if where else ''}) LOOP\n"
            "v_count := v_count + 1;\n"
            + (f"IF v_count > {max_rows} THEN RAISE_APPLICATION_ERROR(-20004, 'Full-table maxRows exceeded'); END IF;\n" if max_rows is not None else '') +
            "IF DBMS_LOB.GETLENGTH(r.j) > 32763 THEN RAISE_APPLICATION_ERROR(-20005, 'JSON row too large'); END IF;\n"
@@ -283,7 +351,8 @@ def write_table_backups(root, user, table, keys, cols, types, rows):
 def render_insert_backup(user, table, names, types, rows):
     lines = [f'-- Captured rows for {user}.{table}; manual recovery aid.',
              '-- Intended for an empty target or rows removed beforehand.',
-             'WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK', 'SET DEFINE OFF']
+             'WHENEVER SQLERROR EXIT FAILURE ROLLBACK', 'SET DEFINE OFF', 'SET SQLBLANKLINES ON',
+             "ALTER SESSION SET NLS_NUMERIC_CHARACTERS='.,';"]
     for row in rows:
         values = ', '.join(literal(row[name], types[name]) for name in names)
         lines.append(f'INSERT INTO {user}.{table} ({", ".join(names)}) VALUES ({values});')
@@ -328,14 +397,20 @@ def capture(db, schemas):
     stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     root = ROOT / 'snapshots' / stamp
     root.mkdir(parents=True, exist_ok=False)
-    snapshot = {'capturedAt': stamp, 'tnsAlias': db['tnsAlias'], 'status': 'INCOMPLETE', 'schemas': []}
+    snapshot = {'version': 2, 'configHash': config_hash(db, schemas), 'capturedAt': stamp,
+                'tnsAlias': db['tnsAlias'], 'status': 'INCOMPLETE', 'schemas': []}
     backup_files = []
     inventory = {}
     path = root / 'snapshot.json'
     try:
         for cfg in schemas:
             user = identifier(cfg['username'])
-            entry = {'username': user, 'objects': [], 'fullTables': [], 'deletes': [], 'updates': []}
+            entry = {'username': user, 'objects': [], 'fullTables': [], 'deletes': [], 'updates': [], 'layouts': {}}
+            for kind in ('objects', 'fullTables', 'deletes', 'updates'):
+                for item in cfg[kind]:
+                    table = identifier(item['table'])
+                    if table not in entry['layouts']:
+                        entry['layouts'][table] = table_layout(db, cfg, table)
             backed_up = set()
             for obj in cfg.get('objects', []):
                 table = identifier(obj['table'])
@@ -371,8 +446,11 @@ def capture(db, schemas):
                 rows = query_full_table(db, cfg, table, types, full.get('maxRows'))
                 if 'expectedRows' in full and len(rows) != full['expectedRows']:
                     fail(f'{user}.{table}: full-table expectedRows mismatch')
+                if len(rows) > full['maxDeleteRows']:
+                    fail(f'{user}.{table}: maxDeleteRows must also allow deleting restored rows on a retry')
                 entry['fullTables'].append({'table': table, 'types': types, 'rows': rows,
-                                            'maxRows': full.get('maxRows'), 'expectedRows': full.get('expectedRows')})
+                                            'maxRows': full.get('maxRows'), 'expectedRows': full.get('expectedRows'),
+                                            'maxDeleteRows': full['maxDeleteRows']})
                 backup_files.extend(write_table_backups(root, user, table, [], list(types), types, rows))
                 inventory[(user, table)] = (types, rows)
                 backed_up.add(table)
@@ -385,6 +463,7 @@ def capture(db, schemas):
                     fail(f'{user}.{table}: delete match column missing')
                 rows = query_full_table(db, cfg, table, types, deletion.get('backupMaxRows'))
                 entry['deletes'].append({'table': table, 'match': match, 'types': {k: types[k] for k in match},
+                                         'maxDeleteRows': deletion['maxDeleteRows'],
                                          'backupMaxRows': deletion.get('backupMaxRows')})
                 if table not in backed_up:
                     backup_files.extend(write_table_backups(root, user, table, [], list(types), types, rows))
@@ -396,16 +475,21 @@ def capture(db, schemas):
                 types = full_metadata(db, cfg, table)
                 match = {identifier(k): v for k, v in update.get('match', {}).items()}
                 values = {identifier(k): v for k, v in update['set'].items()}
-                if not set(match) | set(values) <= set(types):
+                keys = [identifier(k) for k in update['key']]
+                if not (set(match) | set(values) | set(keys)) <= set(types):
                     fail(f'{user}.{table}: UPDATE column missing')
+                check_keys(db, cfg, table, keys)
                 if table not in backed_up:
                     rows = query_full_table(db, cfg, table, types, update.get('backupMaxRows'))
                     backup_files.extend(write_table_backups(root, user, table, [], list(types), types, rows))
                     inventory[(user, table)] = (types, rows)
                     backed_up.add(table)
                     print(f'{user}.{table}: {len(rows)} full-table backup rows for UPDATE')
+                if update.get('backupMaxRows') is not None and len(inventory[(user, table)][1]) > update['backupMaxRows']:
+                    fail(f'{user}.{table}: backupMaxRows exceeded')
                 entry['updates'].append({'table': table, 'match': match, 'set': values,
-                                         'types': {k: types[k] for k in list(match) + list(values)},
+                                         'key': keys,
+                                         'types': {k: types[k] for k in list(match) + list(values) + keys},
                                          'expectedRows': update.get('expectedRows'),
                                          'backupMaxRows': update.get('backupMaxRows')})
             entry['steps'] = cfg['_steps']
@@ -438,6 +522,8 @@ def read_snapshot(path, db, schemas):
     if hashlib.sha256(raw).hexdigest() != expected:
         fail('Snapshot checksum mismatch')
     snap = json.loads(raw)
+    if snap.get('version') != 2 or snap.get('configHash') != config_hash(db, schemas):
+        fail('Snapshot version/configuration mismatch; capture a new version 2 snapshot')
     if snap['status'] != 'SUCCESS' or snap['tnsAlias'] != db['tnsAlias']:
         fail('Incomplete snapshot or TNS alias mismatch')
     if [x['username'] for x in snap['schemas']] != [identifier(c['username']) for c in schemas]:
@@ -471,133 +557,308 @@ def read_snapshot(path, db, schemas):
                 fail('Fixed UPDATE configuration changed since capture')
     return snap
 
-def restore(db, schemas, snap):
-    # Preflight every destination before any irreversible TRUNCATE.
-    for cfg, entry in zip(schemas, snap['schemas']):
+def config_hash(db, schemas):
+    config = {'tnsAlias': db['tnsAlias'], 'expectedTarget': db['expectedTarget'],
+              'schemaOrder': db['schemaOrder'],
+              'schemas': [{k: v for k, v in cfg.items() if k != 'password'} for cfg in schemas]}
+    return digest(config)
+
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+
+
+def table_layout(db, cfg, table):
+    fields = {'name': 'column_name', 'type': 'data_type', 'bytes': 'data_length',
+              'precision': 'data_precision', 'scale': 'data_scale', 'chars': 'char_length',
+              'charUsed': 'char_used', 'nullable': 'nullable', 'identity': 'identity_column',
+              'virtual': 'virtual_column', 'hidden': 'hidden_column', 'defaultOnNull': 'default_on_null'}
+    pairs = ', '.join(f"'{key}' VALUE {column}" for key, column in fields.items())
+    sql = (f"SELECT 'LAYOUT|' || JSON_OBJECT({pairs} NULL ON NULL) FROM user_tab_cols "
+           f"WHERE table_name = {quoted(table)} AND user_generated = 'YES' ORDER BY internal_column_id;\n")
+    rows = [json.loads(line.strip()[7:]) for line in sqlplus(db, cfg, sql).splitlines()
+            if line.strip().startswith('LAYOUT|')]
+    if not rows:
+        fail(f'{cfg["username"]}.{table}: table layout missing')
+    return {row.pop('name'): row for row in rows}
+
+
+def scalar(db, cfg, query):
+    output = sqlplus(db, cfg, f"SELECT 'CHECK|' || ({query}) FROM dual;\n")
+    values = [int(line.strip()[6:]) for line in output.splitlines() if line.strip().startswith('CHECK|')]
+    if len(values) != 1:
+        fail('Missing or ambiguous database count')
+    return values[0]
+
+
+def check_keys(db, cfg, table, keys):
+    nulls = ' OR '.join(f'{k} IS NULL' for k in keys)
+    query = (f'SELECT COUNT(*) FROM (SELECT {", ".join(keys)} FROM {table} '
+             f'GROUP BY {", ".join(keys)} HAVING COUNT(*) > 1 OR {nulls})')
+    if scalar(db, cfg, query):
+        fail(f'{cfg["username"]}.{table}: stable keys must be unique and non-null')
+
+
+def check_update_count(update, count):
+    expected = update.get('expectedRows')
+    if (expected is not None and count != expected) or (expected is None and update['match'] and count == 0):
+        fail(f'{update["table"]}: unexpected UPDATE row count: {count}')
+
+
+def replacement_dependencies(db, cfg, entry):
+    tables = [entry['fullTables'][step['index']]['table'] for step in entry['steps'] if step['type'] == 'replaceTable']
+    if not tables:
+        return
+    # DBA_CONSTRAINTS is deliberate: ALL_CONSTRAINTS can hide incoming foreign
+    # keys from schemas to which this account has no object privileges.
+    sql = ("SELECT 'FK|' || c.owner || '|' || c.table_name || '|' || p.table_name "
+           'FROM sys.dba_constraints c JOIN sys.dba_constraints p '
+           'ON p.owner = c.r_owner AND p.constraint_name = c.r_constraint_name '
+           f"WHERE c.constraint_type = 'R' AND c.status = 'ENABLED' AND p.owner = {quoted(cfg['username'])} "
+           f"AND p.table_name IN ({','.join(quoted(t) for t in tables)});\n")
+    for line in sqlplus(db, cfg, sql).splitlines():
+        if not line.strip().startswith('FK|'):
+            continue
+        owner, child, parent = line.strip()[3:].split('|')
+        if owner != cfg['username'] or child not in tables or tables.index(child) <= tables.index(parent):
+            fail(f'{owner}.{child} -> {cfg["username"]}.{parent}: replacement requires children '
+                 'in the same schema, with parent-first insert order; cross-schema/self/cyclic FKs need DBA handling')
+
+
+def value_checks(table, values, layout):
+    checks = []
+    for col, value in values.items():
+        info = layout[col]
+        typ = normalized_type(info['type'])
+        expr = literal(value, typ)
+        bad = []
+        if info['nullable'] == 'N':
+            bad.append(f'{expr} IS NULL')
+        if typ in {'VARCHAR2', 'CHAR', 'NVARCHAR2', 'NCHAR'}:
+            national = typ in {'NVARCHAR2', 'NCHAR'}
+            function = 'LENGTH' if national or info['charUsed'] == 'C' else 'LENGTHB'
+            size = info['chars'] if function == 'LENGTH' else info['bytes']
+            bad.append(f'{function}({expr}) > {size}')
+        elif typ == 'NUMBER' and (info['precision'] is not None or info['scale'] is not None):
+            cast = f"NUMBER({info['precision'] or 38},{info['scale'] or 0})"
+            bad.append(f'CAST({expr} AS {cast}) <> {expr}')
+        if bad:
+            checks.append(f"SELECT COUNT(*) INTO v_count FROM dual WHERE {' OR '.join(bad)};\n"
+                          f"IF v_count <> 0 THEN RAISE_APPLICATION_ERROR(-20011, '{table}.{col}: value does not fit'); END IF;")
+        # Evaluate conversion even for nullable DATE/TIMESTAMP columns.
+        checks.append(f'SELECT COUNT(*) INTO v_count FROM dual WHERE {expr} IS NULL;')
+    return '\n'.join(checks)
+
+
+def load_restore_plan(path, snap, db):
+    if path is None or not path.exists():
+        return None
+    wrapper = json.loads(path.read_text(encoding='utf-8'))
+    plan = wrapper['plan']
+    if wrapper.get('sha256') != digest(plan) or plan.get('snapshotHash') != digest(snap) or plan.get('target') != db['expectedTarget']:
+        fail('Restore plan checksum/snapshot/target mismatch')
+    return plan
+
+
+def save_restore_plan(path, plan):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent, delete=False) as stream:
+        tmp = Path(stream.name)
+        json.dump({'sha256': digest(plan), 'plan': plan}, stream, ensure_ascii=False, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    try:
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def preflight(db, schemas, snap, state_path=None):
+    previous = load_restore_plan(state_path, snap, db)
+    plan = previous or {'snapshotHash': digest(snap), 'target': db['expectedTarget'], 'schemas': []}
+    for schema_index, (cfg, entry) in enumerate(zip(schemas, snap['schemas'])):
+        for table, captured in entry['layouts'].items():
+            if table_layout(db, cfg, table) != captured:
+                fail(f'{cfg["username"]}.{table}: layout changed (type/length/precision/nullability/identity)')
+            if scalar(db, cfg, f"SELECT COUNT(*) FROM user_triggers WHERE table_name = {quoted(table)} AND status = 'ENABLED'"):
+                fail(f'{table}: enabled triggers require DBA handling before restore')
+        replacement_dependencies(db, cfg, entry)
         for full in entry['fullTables']:
-            if full_metadata(db, cfg, full['table']) != full['types']:
-                fail(f'{entry["username"]}.{full["table"]}: column types changed')
+            layout = entry['layouts'][full['table']]
+            if any(c['identity'] == 'YES' or c['hidden'] == 'YES' for c in layout.values()):
+                fail(f'{full["table"]}: replaceTable does not support identity or invisible columns')
+            count = scalar(db, cfg, f'SELECT COUNT(*) FROM {full["table"]}')
+            if count > full['maxDeleteRows']:
+                fail(f'{full["table"]}: maxDeleteRows exceeded ({count})')
         for obj in entry['objects']:
-            if metadata(db, cfg, obj['table'], list(obj['types'])) != obj['types']:
-                fail(f'{entry["username"]}.{obj["table"]}: restore column types changed')
-        for operation in entry['updates'] + entry['deletes']:
-            if metadata(db, cfg, operation['table'], list(operation['types'])) != operation['types']:
-                fail(f'{entry["username"]}.{operation["table"]}: configured column types changed')
+            layout = entry['layouts'][obj['table']]
+            if any(layout[c]['identity'] == 'YES' or layout[c]['virtual'] == 'YES' for c in obj['columns']):
+                fail('restoreRows cannot write identity or virtual columns')
+            query_rows(db, cfg, {**obj, 'keyValues': [[r[k] for k in obj['key']] for r in obj['rows']]}, obj['types'])
+        for deletion in entry['deletes']:
+            where = delete_predicate(deletion['match'], deletion['types'])
+            count = scalar(db, cfg, f'SELECT COUNT(*) FROM {deletion["table"]} WHERE {where}')
+            if count > deletion['maxDeleteRows']:
+                fail(f'{deletion["table"]}: maxDeleteRows exceeded ({count})')
+        schema_plan = previous['schemas'][schema_index] if previous else {'updates': []}
+        used = set()
+        for index, update in enumerate(entry['updates']):
+            table, keys = update['table'], update['key']
+            layout = entry['layouts'][table]
+            if any(layout[c]['identity'] == 'YES' or layout[c]['virtual'] == 'YES' for c in update['set']):
+                fail('UPDATE cannot write identity or virtual columns')
+            check_keys(db, cfg, table, keys)
+            checks = value_checks(table, update['set'], layout)
+            sqlplus(db, cfg, 'DECLARE v_count NUMBER; BEGIN\n' + checks + '\nEND;\n/\n')
+            if previous:
+                rows = schema_plan['updates'][index]['rows']
+                query_rows(db, cfg, {'table': table, 'key': keys, 'columns': [],
+                                    'keyValues': [[row[k] for k in keys] for row in rows]}, update['types'])
+            else:
+                where = delete_predicate(update['match'], update['types']) if update['match'] else None
+                rows = query_full_table(db, cfg, table, {k: update['types'][k] for k in keys}, update['expectedRows'], where)
+                schema_plan['updates'].append({'rows': rows})
+            check_update_count(update, len(rows))
+            for row in rows:
+                marker = (table, tuple(keys), tuple(row[k] for k in keys))
+                if marker in used:
+                    fail(f'{table}: overlapping UPDATE steps are not supported')
+                used.add(marker)
+                for deletion in entry['deletes']:
+                    if deletion['table'] != table:
+                        continue
+                    post_match = {k: update['set'].get(k, v) for k, v in deletion['match'].items()}
+                    # Check deletion against the row after this UPDATE, using SQL
+                    # comparisons so CHAR padding and Oracle NULL rules apply.
+                    terms = []
+                    for col, wanted in deletion['match'].items():
+                        expr = literal(post_match[col], update['types'][col]) if col in update['set'] else col
+                        typ = deletion['types'][col]
+                        terms.append(f'{expr} IS NULL' if wanted is None or wanted == '' else f'{expr} = {literal(wanted, typ)}')
+                    clause = predicate(keys, [row[k] for k in keys], update['types'])
+                    original = delete_predicate(deletion['match'], deletion['types'])
+                    both = f'({original}) OR ({" AND ".join(terms)})'
+                    if scalar(db, cfg, f'SELECT COUNT(*) FROM {table} WHERE {clause} AND ({both})'):
+                        fail(f'{table}: DELETE overlaps rows needed for UPDATE validation')
+        if not previous:
+            plan['schemas'].append(schema_plan)
+    print('PREFLIGHT SUCCESS (read-only database checks)')
+    return plan
 
-    kind_map = {'restoreRows': 'objects', 'replaceTable': 'fullTables', 'update': 'updates', 'delete': 'deletes'}
-    full_steps = [(cfg, entry[kind_map[step['type']]][step['index']])
-                  for cfg, entry in zip(schemas, snap['schemas'])
-                  for step in entry['steps'] if step['type'] == 'replaceTable']
-    # Children first: TRUNCATE phase is intentionally reverse of the configured insertion order.
-    for cfg, full in reversed(full_steps):
-        name = f'{cfg["username"]}.{full["table"]}'
-        sqlplus(db, cfg, f'TRUNCATE TABLE {full["table"]};\n')
-        print(f'{name}: truncated', flush=True)
 
-    for cfg, entry in zip(schemas, snap['schemas']):
-        for step in entry['steps']:
-            kind = step['type']
-            item = entry[kind_map[kind]][step['index']]
-            name = f'{entry["username"]}.{item["table"]}'
-            if kind == 'restoreRows':
-                statements = []
-                for row in item['rows']:
-                    sets = ', '.join(f'{col} = {literal(row[col], item["types"][col])}' for col in item['columns'])
-                    clause = predicate(item['key'], [row[k] for k in item['key']], item['types'])
-                    statements.append(f'UPDATE {item["table"]} SET {sets} WHERE {clause};\n'
-                                      f'IF SQL%ROWCOUNT != 1 THEN RAISE_APPLICATION_ERROR(-20003, {quoted(name + ": affected row count != 1")}); END IF;')
-                chunks = [statements[i:i + 50] for i in range(0, len(statements), 50)]
-                script = ''.join('BEGIN\n' + '\n'.join(chunk) + '\nEND;\n/\n' for chunk in chunks) + 'COMMIT;\n'
-                sqlplus(db, cfg, script)
-                print(f'{name}: restored {len(statements)} selected rows')
-            elif kind == 'replaceTable':
-                rows, types = item['rows'], item['types']
-                if rows:
-                    columns = ', '.join(types)
-                    inserts = '\n'.join(f'INSERT INTO {item["table"]} ({columns}) VALUES (' +
-                                        ', '.join(literal(row[col], typ) for col, typ in types.items()) + ');'
-                                        for row in rows)
-                    sqlplus(db, cfg, f'SET DEFINE OFF\n{inserts}\nCOMMIT;\n')
-                print(f'{name}: inserted {len(rows)} rows')
-            elif kind == 'update':
-                clause = f" WHERE {delete_predicate(item['match'], item['types'])}" if item['match'] else ''
-                assignments = ', '.join(f'{col} = {literal(value, item["types"][col])}' for col, value in item['set'].items())
-                expected = item['expectedRows']
-                check = (f'IF SQL%ROWCOUNT != {expected} THEN RAISE_APPLICATION_ERROR(-20006, {quoted(name + ": unexpected UPDATE row count")}); END IF;\n'
-                         if expected is not None else
-                         f'IF SQL%ROWCOUNT = 0 THEN RAISE_APPLICATION_ERROR(-20006, {quoted(name + ": unexpected UPDATE row count")}); END IF;\n'
-                         if item['match'] else '')
-                sql = (f'BEGIN UPDATE {item["table"]} SET {assignments}{clause};\n'
-                       f'{check}'
-                       'COMMIT; EXCEPTION WHEN OTHERS THEN ROLLBACK; RAISE; END;\n/\n')
-                sqlplus(db, cfg, sql)
-                print(f'{name}: fixed UPDATE applied')
-            elif kind == 'delete':
-                where = delete_predicate(item['match'], item['types'])
-                sqlplus(db, cfg, f'DELETE FROM {item["table"]} WHERE {where};\nCOMMIT;\n')
-                print(f'{name}: matching rows deleted')
+def assert_count(query, expected, label):
+    return (f'SELECT COUNT(*) INTO v_count FROM ({query});\n'
+            f"IF v_count <> {expected} THEN RAISE_APPLICATION_ERROR(-20012, {quoted(label)}); END IF;")
+
+
+def validation_statements(entry, schema_plan):
+    statements = []
+    for obj in entry['objects']:
+        for row in obj['rows']:
+            where = captured_predicate(row, obj['types'])
+            statements.append(assert_count(f'SELECT 1 FROM {obj["table"]} WHERE {where}', 1,
+                                           obj['table'] + ': restored row mismatch'))
+    for full in entry['fullTables']:
+        statements.append(assert_count(f'SELECT 1 FROM {full["table"]}', len(full['rows']),
+                                       full['table'] + ': replacement count mismatch'))
+        grouped = Counter(json.dumps(row, sort_keys=True) for row in full['rows'])
+        for encoded, count in grouped.items():
+            where = captured_predicate(json.loads(encoded), full['types'])
+            statements.append(assert_count(f'SELECT 1 FROM {full["table"]} WHERE {where}', count,
+                                           full['table'] + ': replacement value mismatch'))
+    for deletion in entry['deletes']:
+        where = delete_predicate(deletion['match'], deletion['types'])
+        statements.append(assert_count(f'SELECT 1 FROM {deletion["table"]} WHERE {where}', 0,
+                                       deletion['table'] + ': deleted rows remain'))
+    for update, selected in zip(entry['updates'], schema_plan['updates']):
+        check_update_count(update, len(selected['rows']))
+        for row in selected['rows']:
+            where = delete_predicate({**row, **update['set']}, update['types'])
+            statements.append(assert_count(f'SELECT 1 FROM {update["table"]} WHERE {where}', 1,
+                                           update['table'] + ': UPDATE key/value mismatch'))
+        if not update['match']:
+            statements.append(assert_count(f'SELECT 1 FROM {update["table"]}', len(selected['rows']),
+                                           update['table'] + ': UPDATE table row count changed'))
+    return statements
+
+
+def schema_restore_sql(entry, schema_plan, first_attempt):
+    statements = [f'LOCK TABLE {table} IN EXCLUSIVE MODE NOWAIT;' for table in sorted(entry['layouts'])]
+    # Check original selectors under the same locks as the writes. On a retry,
+    # selectors may have changed, so use the durable plan's original keys.
+    if first_attempt:
+        for update, selected in zip(entry['updates'], schema_plan['updates']):
+            clause = ' WHERE ' + delete_predicate(update['match'], update['types']) if update['match'] else ''
+            statements.append(assert_count(f'SELECT 1 FROM {update["table"]}{clause}', len(selected['rows']),
+                                           update['table'] + ': UPDATE selection changed since preflight'))
+            for row in selected['rows']:
+                where = delete_predicate(row, update['types'])
+                if update['match']:
+                    where += ' AND ' + delete_predicate(update['match'], update['types'])
+                statements.append(assert_count(f'SELECT 1 FROM {update["table"]} WHERE {where}', 1,
+                                               update['table'] + ': UPDATE key selection changed'))
+    for step in reversed(entry['steps']):
+        if step['type'] == 'replaceTable':
+            item = entry['fullTables'][step['index']]
+            statements.append(f'DELETE FROM {item["table"]};')
+            statements.append(f"IF SQL%ROWCOUNT > {item['maxDeleteRows']} THEN "
+                              "RAISE_APPLICATION_ERROR(-20013, 'Replacement maxDeleteRows exceeded'); END IF;")
+    kinds = {'restoreRows': 'objects', 'replaceTable': 'fullTables', 'update': 'updates', 'delete': 'deletes'}
+    for step in entry['steps']:
+        item = entry[kinds[step['type']]][step['index']]
+        table = item['table']
+        if step['type'] == 'replaceTable':
+            for row in item['rows']:
+                values = ',\n'.join(literal(row[col], typ) for col, typ in item['types'].items())
+                statements.append(f'INSERT INTO {table} ({", ".join(item["types"])}) VALUES (\n{values});')
+        elif step['type'] in {'restoreRows', 'update'}:
+            rows = item['rows'] if step['type'] == 'restoreRows' else schema_plan['updates'][step['index']]['rows']
+            for row in rows:
+                values = {col: row[col] for col in item['columns']} if step['type'] == 'restoreRows' else item['set']
+                assignments = ',\n'.join(f'{col} = {literal(value, item["types"][col])}' for col, value in values.items())
+                where = predicate(item['key'], [row[k] for k in item['key']], item['types'])
+                statements.append(f'UPDATE {table} SET {assignments} WHERE {where};')
+                statements.append("IF SQL%ROWCOUNT <> 1 THEN RAISE_APPLICATION_ERROR(-20014, 'Missing or duplicate update key'); END IF;")
+        else:
+            where = delete_predicate(item['match'], item['types'])
+            statements.append(f'DELETE FROM {table} WHERE {where};')
+            statements.append(f"IF SQL%ROWCOUNT > {item['maxDeleteRows']} THEN "
+                              "RAISE_APPLICATION_ERROR(-20015, 'DELETE maxDeleteRows exceeded'); END IF;")
+    statements.extend(validation_statements(entry, schema_plan))
+    return ('DECLARE v_count NUMBER; BEGIN\n' + '\n'.join(statements) +
+            '\nCOMMIT;\nEXCEPTION WHEN OTHERS THEN ROLLBACK; RAISE; END;\n/\n')
+
+
+def restore(db, schemas, snap, state_path):
+    first_attempt = not state_path.exists()
+    plan = preflight(db, schemas, snap, state_path)
+    # Persist all post-refresh keys BEFORE the first database write, including
+    # before a possibly successful COMMIT whose acknowledgement could be lost.
+    save_restore_plan(state_path, plan)
+    for cfg, entry, schema_plan in zip(schemas, snap['schemas'], plan['schemas']):
+        sqlplus(db, cfg, schema_restore_sql(entry, schema_plan, first_attempt))
+        print(f'{cfg["username"]}: schema transaction committed and validated', flush=True)
     print('RESTORE SUCCESS')
 
-def validate(db, schemas, snap):
-    for cfg, entry in zip(schemas, snap['schemas']):
-        for obj in entry['objects']:
-            live = query_rows(db, cfg, {'table': obj['table'], 'key': obj['key'], 'columns': obj['columns'], 'keyValues': [[row[k] for k in obj['key']] for row in obj['rows']]}, obj['types'])
-            if live != obj['rows']:
-                fail(f'{entry["username"]}.{obj["table"]}: validation mismatch')
-            print(f'{entry["username"]}.{obj["table"]}: validated {len(live)} rows')
-        for full in entry.get('fullTables', []):
-            live_types = full_metadata(db, cfg, full['table'])
-            if live_types != full['types']:
-                fail(f'{entry["username"]}.{full["table"]}: column types changed')
-            live = query_full_table(db, cfg, full['table'], live_types, full['maxRows'])
-            as_multiset = lambda rows: Counter(json.dumps(row, sort_keys=True, ensure_ascii=False) for row in rows)
-            if as_multiset(live) != as_multiset(full['rows']):
-                fail(f'{entry["username"]}.{full["table"]}: full-table validation mismatch')
-            print(f'{entry["username"]}.{full["table"]}: validated all {len(live)} rows')
-        for deletion in entry.get('deletes', []):
-            where = delete_predicate(deletion['match'], deletion['types'])
-            sql = f"SELECT 'DELETE_REMAINING|' || COUNT(*) FROM {deletion['table']} WHERE {where};\n"
-            output = sqlplus(db, cfg, sql)
-            counts = [int(line.strip().split('|', 1)[1]) for line in output.splitlines() if line.strip().startswith('DELETE_REMAINING|')]
-            if counts != [0]:
-                fail(f'{entry["username"]}.{deletion["table"]}: matching rows remain')
-            print(f'{entry["username"]}.{deletion["table"]}: delete validated')
-        for update in entry.get('updates', []):
-            clause = f" WHERE {delete_predicate(update['match'], update['types'])}" if update['match'] else ''
-            overlap = set(update['match']) & set(update['set'])
-            if overlap:
-                stable_match = {k: v for k, v in update['match'].items() if k not in overlap}
-                new_match = {**stable_match, **update['set']}
-                old_sql = f"SELECT 'UPDATE_OLD|' || COUNT(*) FROM {update['table']}{clause};\n"
-                new_sql = f"SELECT 'UPDATE_NEW|' || COUNT(*) FROM {update['table']} WHERE {delete_predicate(new_match, update['types'])};\n"
-                old_output = sqlplus(db, cfg, old_sql)
-                new_output = sqlplus(db, cfg, new_sql)
-                old_counts = [int(line.strip().split('|', 1)[1]) for line in old_output.splitlines() if line.strip().startswith('UPDATE_OLD|')]
-                new_counts = [int(line.strip().split('|', 1)[1]) for line in new_output.splitlines() if line.strip().startswith('UPDATE_NEW|')]
-                if old_counts != [0] or len(new_counts) != 1 or new_counts[0] == 0:
-                    fail(f'{entry["username"]}.{update["table"]}: fixed UPDATE validation mismatch')
-                print(f'{entry["username"]}.{update["table"]}: fixed UPDATE validated')
-                continue
-            mismatches = []
-            for col, value in update['set'].items():
-                mismatches.append(f'{col} IS NOT NULL' if value is None else
-                                  f'({col} IS NULL OR {col} <> {literal(value, update["types"][col])})')
-            sql = ("SELECT 'UPDATE_CHECK|' || COUNT(*) || '|' || "
-                   f"COALESCE(SUM(CASE WHEN {' OR '.join(mismatches)} THEN 1 ELSE 0 END), 0) "
-                   f'FROM {update["table"]}{clause};\n')
-            output = sqlplus(db, cfg, sql)
-            found = [line.strip().split('|')[1:] for line in output.splitlines() if line.strip().startswith('UPDATE_CHECK|')]
-            if len(found) != 1 or len(found[0]) != 2:
-                fail(f'{entry["username"]}.{update["table"]}: validation output missing')
-            count, wrong = map(int, found[0])
-            if wrong or (update['expectedRows'] is not None and count != update['expectedRows']) or (update['expectedRows'] is None and update['match'] and count == 0):
-                fail(f'{entry["username"]}.{update["table"]}: fixed UPDATE validation mismatch')
-            print(f'{entry["username"]}.{update["table"]}: fixed UPDATE validated ({count} rows)')
+
+def validate(db, schemas, snap, state_path):
+    plan = load_restore_plan(state_path, snap, db)
+    if plan is None and any(entry['updates'] for entry in snap['schemas']):
+        fail('UPDATE validation requires restore-plan.json created by restore')
+    for index, (cfg, entry) in enumerate(zip(schemas, snap['schemas'])):
+        schema_plan = plan['schemas'][index] if plan else {'updates': []}
+        for table, layout in entry['layouts'].items():
+            if table_layout(db, cfg, table) != layout:
+                fail(f'{table}: layout changed')
+        checks = validation_statements(entry, schema_plan)
+        sqlplus(db, cfg, 'DECLARE v_count NUMBER; BEGIN\n' + '\n'.join(checks or ['NULL;']) + '\nEND;\n/\n')
+        print(f'{cfg["username"]}: all configured results validated')
     print('VALIDATION SUCCESS')
+
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['capture', 'restore', 'validate'])
+    parser.add_argument('action', choices=['capture', 'preflight', 'restore', 'validate'])
     parser.add_argument('--snapshot', type=Path)
     args = parser.parse_args()
     db, schemas = load_config()
@@ -607,7 +868,8 @@ def main():
         if not args.snapshot:
             fail('--snapshot is required')
         snap = read_snapshot(args.snapshot, db, schemas)
-        (restore if args.action == 'restore' else validate)(db, schemas, snap)
+        actions = {'preflight': preflight, 'restore': restore, 'validate': validate}
+        actions[args.action](db, schemas, snap, args.snapshot.resolve().parent / 'restore-plan.json')
 
 if __name__ == '__main__':
     try:

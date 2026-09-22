@@ -1,42 +1,53 @@
 # Ukázka dvou schémat
 
-`config/credentials.json` obsahuje oba účty:
+Nejprve připravte `database.json`, `credentials.json` a povinný `expectedTarget` podle [README](README.md). Pro tuto ukázku nastavte `schemaOrder` na `["APP1", "CT"]` a vytvořte pouze odpovídající lokální schema JSON soubory; soubory `.example.json` mohou zůstat.
 
-```json
-{
-  "users": {
-    "APP1": {"username": "APP1", "password": "HESLO_APP1"},
-    "CT": {"username": "CT", "password": "HESLO_CT"}
-  }
-}
-```
-
-`config/database.json` určí pořadí schémat:
-
-```json
-{"tnsAlias": "TESTDB", "sqlplusPath": "sqlplus.exe", "schemaOrder": ["APP1", "CT"]}
-```
-
-V `config/schemas/APP1.json` jsou všechny kroky pro APP1 v pořadí, například:
+V `config/schemas/APP1.json`:
 
 ```json
 {
   "steps": [
-    {"type": "delete", "table": "TEMP_MESSAGES", "match": {"SOURCE": "PROD", "STATUS": "PENDING"}}
+    {
+      "type": "delete",
+      "table": "TEMP_MESSAGES",
+      "match": {"SOURCE": "PROD", "STATUS": "PENDING"},
+      "maxDeleteRows": 1000
+    }
   ]
 }
 ```
 
-V `config/schemas/CT.json` jsou kroky pro CT:
+V `config/schemas/CT.json`:
 
 ```json
 {
   "steps": [
-    {"type": "update", "table": "CONFIG", "match": {"CONFIG_KEY": "API_URL"}, "set": {"CONFIG_VALUE": "https://api-test.example.cz"}, "expectedRows": 1},
-    {"type": "update", "table": "CONFIG", "match": {"CONFIG_KEY": "CALLBACK_URL"}, "set": {"CONFIG_VALUE": "https://callback-test.example.cz", "DESCRIPTIONS": "Test callback"}, "expectedRows": 1},
-    {"type": "delete", "table": "CONFIG", "match": {"CONFIG_VALUE": "DUAL_USER"}}
+    {
+      "type": "update",
+      "table": "CONFIG",
+      "key": ["CONFIG_KEY"],
+      "match": {"CONFIG_KEY": "API_URL"},
+      "set": {"CONFIG_VALUE": "https://api-test.example.cz"},
+      "expectedRows": 1
+    },
+    {
+      "type": "update",
+      "table": "CONFIG",
+      "key": ["CONFIG_KEY"],
+      "match": {"CONFIG_KEY": "CALLBACK_URL"},
+      "set": {"CONFIG_VALUE": "https://callback-test.example.cz", "DESCRIPTIONS": "Test callback"},
+      "expectedRows": 1
+    },
+    {
+      "type": "delete",
+      "table": "CONFIG",
+      "match": {"CONFIG_VALUE": "DUAL_USER"},
+      "maxDeleteRows": 10
+    }
   ]
 }
 ```
 
-Po DBA refreshi se nejprve provede mazání v APP1, pak oba UPDATE kroky v CT v uvedeném pořadí a následně DELETE v CT. Před refreshem vznikne úplná CSV a SQL záloha obou tabulek.
+`CONFIG_KEY` musí být neprázdný a unikátní v celé CONFIG. Pokud není, použijte skutečný primární klíč, například `ID`. DELETE nesmí odstranit řádky potřebné pro validaci obou UPDATE; preflight takový překryv odmítne.
+
+Před refreshem capture uloží úplné CSV a SQL zálohy tabulek. Po refreshi nejprve spusťte preflight. Restore uloží klíče cílových UPDATE řádků, provede a ověří DELETE v APP1 a potvrdí transakci APP1. Pak provede oba UPDATE a DELETE v CT, ověří jejich výsledky a potvrdí transakci CT. Pokud CT selže, jeho změny se vrátí, ale potvrzený DELETE v APP1 zůstane. Po odstranění příčiny lze stejnou obnovu zopakovat se zachovaným snapshotem i restore-plan.json.

@@ -1,5 +1,15 @@
 {
   "tnsAlias": "TESTDB",
   "sqlplusPath": "sqlplus.exe",
-  "schemaOrder": ["APP1", "APP2", "CT"]
+  "schemaOrder": [
+    "APP1",
+    "APP2",
+    "CT"
+  ],
+  "expectedTarget": {
+    "dbUniqueName": "TESTDB",
+    "serviceName": "testpdb.example.cz",
+    "conName": "TESTPDB"
+  },
+  "timeoutSeconds": 300
 }

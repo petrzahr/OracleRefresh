@@ -9,7 +9,10 @@
       "set": {
         "CONFIG_VALUE": "https://api-test.example.cz"
       },
-      "expectedRows": 1
+      "expectedRows": 1,
+      "key": [
+        "CONFIG_KEY"
+      ]
     },
     {
       "type": "update",
@@ -21,14 +24,18 @@
         "CONFIG_VALUE": "https://callback-test.example.cz",
         "DESCRIPTIONS": "Test callback"
       },
-      "expectedRows": 1
+      "expectedRows": 1,
+      "key": [
+        "CONFIG_KEY"
+      ]
     },
     {
       "type": "delete",
       "table": "CONFIG",
       "match": {
         "CONFIG_VALUE": "DUAL_USER"
-      }
+      },
+      "maxDeleteRows": 10000
     }
   ]
 }

@@ -6,3 +6,6 @@
 !/snapshots/.gitkeep
 /logs/*
 !/logs/.gitkeep
+__pycache__/
+*.pyc
+/config/integration.json
