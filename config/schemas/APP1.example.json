@@ -38,9 +38,15 @@
     },
     {
       "type": "replaceTable",
-      "table": "LOOKUP",
-      "maxRows": 10000,
-      "maxDeleteRows": 10000
+      "table": "LOOKUP1"
+    },
+	    {
+      "type": "replaceTable",
+      "table": "LOOKUP2"
+    },
+	    {
+      "type": "replaceTable",
+      "table": "LOOKUP3"
     },
     {
       "type": "delete",

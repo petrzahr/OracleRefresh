@@ -138,8 +138,8 @@ def load_config():
         for full in cfg.get('fullTables', []):
             identifier(full['table'])
             limit = full.get('maxDeleteRows')
-            if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
-                fail('Every replaceTable requires a nonnegative maxDeleteRows for the target')
+            if 'maxDeleteRows' in full and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 0):
+                fail('replaceTable maxDeleteRows must be a nonnegative integer when specified')
             if 'maxRows' in full and (not isinstance(full['maxRows'], int) or isinstance(full['maxRows'], bool) or full['maxRows'] < 0):
                 fail(f'{user}.{full["table"]}: invalid maxRows')
             if 'expectedRows' in full and (not isinstance(full['expectedRows'], int) or isinstance(full['expectedRows'], bool) or full['expectedRows'] < 0 or ('maxRows' in full and full['expectedRows'] > full['maxRows'])):
@@ -446,11 +446,11 @@ def capture(db, schemas):
                 rows = query_full_table(db, cfg, table, types, full.get('maxRows'))
                 if 'expectedRows' in full and len(rows) != full['expectedRows']:
                     fail(f'{user}.{table}: full-table expectedRows mismatch')
-                if len(rows) > full['maxDeleteRows']:
+                if full.get('maxDeleteRows') is not None and len(rows) > full['maxDeleteRows']:
                     fail(f'{user}.{table}: maxDeleteRows must also allow deleting restored rows on a retry')
                 entry['fullTables'].append({'table': table, 'types': types, 'rows': rows,
                                             'maxRows': full.get('maxRows'), 'expectedRows': full.get('expectedRows'),
-                                            'maxDeleteRows': full['maxDeleteRows']})
+                                            'maxDeleteRows': full.get('maxDeleteRows')})
                 backup_files.extend(write_table_backups(root, user, table, [], list(types), types, rows))
                 inventory[(user, table)] = (types, rows)
                 backed_up.add(table)
@@ -687,9 +687,10 @@ def preflight(db, schemas, snap, state_path=None):
             layout = entry['layouts'][full['table']]
             if any(c['identity'] == 'YES' or c['hidden'] == 'YES' for c in layout.values()):
                 fail(f'{full["table"]}: replaceTable does not support identity or invisible columns')
-            count = scalar(db, cfg, f'SELECT COUNT(*) FROM {full["table"]}')
-            if count > full['maxDeleteRows']:
-                fail(f'{full["table"]}: maxDeleteRows exceeded ({count})')
+            if full.get('maxDeleteRows') is not None:
+                count = scalar(db, cfg, f'SELECT COUNT(*) FROM {full["table"]}')
+                if count > full['maxDeleteRows']:
+                    fail(f'{full["table"]}: maxDeleteRows exceeded ({count})')
         for obj in entry['objects']:
             layout = entry['layouts'][obj['table']]
             if any(layout[c]['identity'] == 'YES' or layout[c]['virtual'] == 'YES' for c in obj['columns']):
@@ -801,8 +802,9 @@ def schema_restore_sql(entry, schema_plan, first_attempt):
         if step['type'] == 'replaceTable':
             item = entry['fullTables'][step['index']]
             statements.append(f'DELETE FROM {item["table"]};')
-            statements.append(f"IF SQL%ROWCOUNT > {item['maxDeleteRows']} THEN "
-                              "RAISE_APPLICATION_ERROR(-20013, 'Replacement maxDeleteRows exceeded'); END IF;")
+            if item.get('maxDeleteRows') is not None:
+                statements.append(f"IF SQL%ROWCOUNT > {item['maxDeleteRows']} THEN "
+                                  "RAISE_APPLICATION_ERROR(-20013, 'Replacement maxDeleteRows exceeded'); END IF;")
     kinds = {'restoreRows': 'objects', 'replaceTable': 'fullTables', 'update': 'updates', 'delete': 'deletes'}
     for step in entry['steps']:
         item = entry[kinds[step['type']]][step['index']]

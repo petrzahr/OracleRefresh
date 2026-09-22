@@ -68,6 +68,19 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'maxDeleteRows'):
             app.load_config()
 
+    def test_replacement_limits_optional(self):
+        self.alter('schemas/APP2.json', lambda v: v['steps'][0].pop('maxDeleteRows', None))
+        self.alter('schemas/APP2.json', lambda v: v['steps'][0].pop('maxRows', None))
+        _, schemas = app.load_config()
+        self.assertNotIn('maxDeleteRows', schemas[1]['fullTables'][0])
+
+    def test_explicit_invalid_replacement_limit_rejected(self):
+        for value in [None, True, -1, '100']:
+            with self.subTest(value=value):
+                self.alter('schemas/APP2.json', lambda v: v['steps'][0].update(maxDeleteRows=value))
+                with self.assertRaisesRegex(ValueError, 'maxDeleteRows'):
+                    app.load_config()
+
     def test_update_key_must_be_stable(self):
         self.alter('schemas/CT.json', lambda v: v['steps'][0]['set'].update(CONFIG_KEY='OTHER'))
         with self.assertRaisesRegex(ValueError, 'stable key'):
@@ -269,6 +282,19 @@ class SafetyTests(unittest.TestCase):
         mocks[1].side_effect = [0, 3]
         with self.assertRaisesRegex(ValueError, 'maxDeleteRows'):
             app.preflight(self.db, [self.cfg], self.snap)
+
+    def test_unlimited_replacement_skips_count_and_retains_validation(self):
+        mocks = self.mocks()
+        self.entry['updates'] = []
+        self.entry['fullTables'] = [dict(table='CONFIG', rows=[{'ID': '1'}], types={'ID': 'NUMBER'}, maxDeleteRows=None)]
+        self.entry['steps'] = [dict(type='replaceTable', index=0)]
+        plan = app.preflight(self.db, [self.cfg], self.snap)
+        self.assertEqual(mocks[1].call_count, 1)  # Trigger check only; no table row count.
+        sql = app.schema_restore_sql(self.entry, plan['schemas'][0], True)
+        self.assertIn('DELETE FROM CONFIG;', sql)
+        self.assertNotIn('maxDeleteRows exceeded', sql)
+        self.assertIn('replacement count mismatch', sql)
+        self.assertIn('COMMIT;', sql)
 
     def test_plan_survives_failed_restore_and_reuses_original_keys(self):
         mocks = self.mocks()

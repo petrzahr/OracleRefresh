@@ -43,7 +43,7 @@ Každý soubor obsahuje jedno pole `steps`.
 | Typ | Povinná pole | Chování |
 | --- | --- | --- |
 | `restoreRows` | `table`, `key`, `columns`, `keyValues` nebo `allRows: true` | Obnoví vybrané sloupce zachycených řádků podle unikátních neprázdných klíčů. `allRows` znamená všechny řádky zachycené před refreshem; další řádky po refreshi ponechá. |
-| `replaceTable` | `table`, `maxDeleteRows` | Nahradí obsah pomocí transakčních DELETE a INSERT. Volitelné `maxRows` omezuje capture a `expectedRows` vyžaduje přesný počet zachycených řádků. |
+| `replaceTable` | `table` | Nahradí obsah pomocí transakčních DELETE a INSERT. Volitelné `maxRows` omezuje capture a `expectedRows` vyžaduje přesný počet zachycených řádků. |
 | `update` | `table`, `key`, `set`; volitelně `match` | Nastaví pevné hodnoty v řádcích vybraných až po refreshi. `key` identifikuje řádky pro provedení, opakování i validaci. |
 | `delete` | `table`, `match`, `maxDeleteRows` | Smaže odpovídající řádky. Nula řádků je platný výsledek, také při opakování obnovy. |
 
@@ -74,7 +74,7 @@ Každý soubor obsahuje jedno pole `steps`.
 
 Bez `match` UPDATE vybere celou tabulku; `key` je i v tomto případě povinný. `expectedRows` kontroluje počet původně vybraných řádků a platí také při validaci. Bez něj filtrovaný UPDATE vyžaduje alespoň jeden řádek; celotabulkový UPDATE připouští i prázdnou tabulku. `expectedRows: 0` je podporováno.
 
-`maxDeleteRows` omezuje počet skutečně mazaných řádků po refreshi. Kontroluje se při preflightu i bezprostředně po DELETE v transakci; překročení způsobí rollback schématu. U `replaceTable` musí limit pokrýt také počet zachycených řádků, aby šla obnova zopakovat. `backupMaxRows` u ostatních kroků omezuje velikost zálohy při capture, nikoli rozsah mazání.
+`maxDeleteRows` je u `replaceTable` nepovinný: při vynechání se smaže celý obsah bez limitu počtu řádků a bez předběžného počítání pro tento limit. Také `maxRows` lze vynechat pro capture bez početního limitu. U filtrovaného kroku `delete` zůstává `maxDeleteRows` povinný. Zadaný `maxDeleteRows` omezuje počet skutečně mazaných řádků po refreshi. Kontroluje se při preflightu i bezprostředně po DELETE v transakci; překročení způsobí rollback schématu. U `replaceTable` musí limit pokrýt také počet zachycených řádků, aby šla obnova zopakovat. `backupMaxRows` u ostatních kroků omezuje velikost zálohy při capture, nikoli rozsah mazání.
 
 ## Provozní postup
 
@@ -116,7 +116,7 @@ Před `CAPTURE SUCCESS` se snapshot i exporty znovu načtou a porovnají se zach
 
 Podporované typy: CHAR, VARCHAR2, NCHAR, NVARCHAR2, NUMBER, DATE, TIMESTAMP a TIMESTAMP WITH TIME ZONE. NUMBER se ukládá jako text, aby se neztratila přesnost. DATE očekává `YYYY-MM-DD HH24:MI:SS`, TIMESTAMP přidává devět desetinných míst a časová zóna offset `+HH:MM`. U časové zóny se zachovává offset, nikoli název regionu. Nepodporované typy, například CLOB/BLOB/RAW a TIMESTAMP WITH LOCAL TIME ZONE, nebo příliš velký JSON řádek způsobí chybu capture. SQL*Plus komunikuje v UTF-8; víceřádkové řetězce se převádějí na bezpečné výrazy s CHR/NCHR.
 
-Snapshoty verze 1 nejsou kompatibilní. Po aktualizaci doplňte `expectedTarget`, `update.key` a `maxDeleteRows` a proveďte nový capture **před** refreshem. Existující snapshoty nepřepisujte.
+Snapshoty verze 1 nejsou kompatibilní. Po aktualizaci doplňte `expectedTarget`, `update.key` a u kroků `delete` také `maxDeleteRows` a proveďte nový capture **před** refreshem. Existující snapshoty nepřepisujte.
 
 Credentials, lokální konfigurace, snapshoty a plány obsahují citlivé údaje a jsou ignorovány Gitem. Hesla jdou SQL*Plus přes stdin, nikoli argumenty procesu; nevypisují se ani hodnoty řádků z chybového SQL.
 
