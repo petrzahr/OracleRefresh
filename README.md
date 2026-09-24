@@ -41,7 +41,7 @@ FROM dual;
 
 Každé spojení ověřuje tyto tři hodnoty a přihlášený účet ještě před pracovními dotazy. Porovnání názvů cíle ignoruje velikost písmen. Samotný TNS alias není důkazem identity databáze. Pro non-CDB vyplňte skutečnou vrácenou hodnotu `CON_NAME`. Očekávaný cíl nastavte nezávisle na snapshotu; nenastavujte jej automaticky podle právě připojené databáze.
 
-Účty používají vlastní tabulky. Pro `replaceTable` potřebují také přímé oprávnění `SELECT ON SYS.DBA_CONSTRAINTS`, aby preflight viděl i příchozí cizí klíče z jinak nepřístupných schémat. Bez něj kontrola skončí chybou. Aktivní triggery na konfigurovaných tabulkách musí před obnovou vyřešit DBA; nástroj je sám nevypíná.
+Účty používají vlastní tabulky. Kontrola cizích klíčů čte `ALL_CONSTRAINTS` a `USER_CONSTRAINTS`; přístup k `SYS.DBA_CONSTRAINTS` není potřeba. Podporované prostředí nemá příchozí cizí klíče mezi různými schématy. Vazby uvnitř schématu se kontrolují automaticky. Nepřístupné externí vazby tento účet nemusí vidět; jejich nepřítomnost je předpokladem nasazení, nikoli výsledkem kontroly. Aktivní triggery na konfigurovaných tabulkách musí před obnovou vyřešit DBA; nástroj je sám nevypíná.
 
 ## Kroky ve schématu
 
@@ -66,10 +66,11 @@ Mazání proběhne `USERGROUPS → USERS`, vkládání `USERS → USERGROUPS`, v
 | `replaceTable` | `table` | Nahradí obsah pomocí transakčních DELETE a INSERT. Volitelné `maxRows` omezuje capture a `expectedRows` vyžaduje přesný počet zachycených řádků. |
 | `update` | `table`, `key`, `set`; volitelně `match` | Nastaví pevné hodnoty v řádcích vybraných až po refreshi. `key` identifikuje řádky pro provedení, opakování i validaci. |
 | `delete` | `table`, `match`, `maxDeleteRows` | Smaže odpovídající řádky. Nula řádků je platný výsledek, také při opakování obnovy. |
+| `insert` | `table`, `match` | Při Capture zachytí celé vybrané řádky a vytvoří CSV/INSERT SQL. Při Restore vloží chybějící zachycené řádky; ostatní řádky ponechá. Volitelné `key`, `maxInsertRows`, `expectedRows`. |
 
 `match` používá rovnosti spojené AND. JSON `null` a prázdný řetězec používají Oracle `IS NULL`. Volné SQL ani OR nejsou povolené. Názvy tabulek a sloupců se normalizují na velká písmena; quoted identifiers nejsou podporovány.
 
-`update.key` musí být jedinečný a neprázdný v cílové tabulce a nesmí se měnit v `set`. Doporučen je primární klíč. Všechny UPDATE stejné tabulky musí použít stejný seznam klíčových sloupců. Překrývající se UPDATE a DELETE zasahující řádky potřebné pro validaci UPDATE preflight odmítne. `restoreRows` a `replaceTable` nelze kombinovat s jinými typy operací na stejné tabulce.
+`update.key` musí být jedinečný a neprázdný v cílové tabulce a nesmí se měnit v `set`. Doporučen je primární klíč. Všechny UPDATE stejné tabulky musí použít stejný seznam klíčových sloupců. Překrývající se UPDATE a DELETE zasahující řádky potřebné pro validaci UPDATE preflight odmítne. `restoreRows`, `replaceTable` a `insert` nelze kombinovat s jinými kroky na stejné tabulce.
 
 ```json
 {
@@ -93,6 +94,28 @@ Mazání proběhne `USERGROUPS → USERS`, vkládání `USERS → USERGROUPS`, v
 ```
 
 Bez `match` UPDATE vybere celou tabulku; `key` je i v tomto případě povinný. `expectedRows` kontroluje počet původně vybraných řádků a platí také při validaci. Bez něj filtrovaný UPDATE vyžaduje alespoň jeden řádek; celotabulkový UPDATE připouští i prázdnou tabulku. `expectedRows: 0` je podporováno.
+
+### Filtrovaný INSERT
+
+```json
+{
+  "type": "insert",
+  "table": "TEMP_MESSAGES",
+  "match": {
+    "SOURCE": "PROD",
+    "STATUS": "PENDING"
+  },
+  "maxInsertRows": 10000
+}
+```
+
+`match` je povinný neprázdný filtr se stejnými pravidly jako u `delete` (rovnosti spojené AND, `null` a prázdný řetězec jako IS NULL). Vyhodnocuje se **při Capture**, nikoli znovu po refreshi. Uloží se všechny podporované uložené sloupce vybraných řádků včetně těch, které nejsou ve filtru. Exporty jsou vedle snapshotu ve složce schématu: `TEMP_MESSAGES.csv` a `TEMP_MESSAGES.insert.sql`. U tohoto kroku obsahují pouze vybrané řádky. SQL soubor obsahuje běžné INSERT příkazy pro ruční použití bez automatického COMMIT; spouštějte jej pouze tehdy, pokud v cíli zachycené řádky ještě nejsou.
+
+Restore používá zachycené hodnoty ze snapshotu, nikoli ručně upravený SQL soubor. Chybějící řádek vloží, shodný existující řádek přeskočí. Existující řádek se stejným klíčem a jinými hodnotami je konflikt: preflight obnovu odmítne, případná pozdější chyba vrátí celou transakci schématu. Dodatečné řádky po refreshi i řádky mimo filtr zůstanou beze změny. Opakování Restore tak nevytváří duplicity.
+
+Klíč se automaticky převezme z aktivního primárního klíče tabulky a uloží do snapshotu. Pokud tabulka primární klíč nemá, zadejte například `"key": ["MESSAGE_ID"]`; lze použít i složený klíč. Sloupce klíče musí být v tabulce jedinečné a neprázdné při Capture i Preflight. Bez vhodného klíče Capture skončí chybou.
+
+`maxInsertRows` je volitelný strop počtu zachycených řádků (nikoli počet nových řádků při opakování). Bez něj není počet omezen. `expectedRows` volitelně požaduje přesný počet; nula vybraných řádků je jinak platná a vytvoří prázdný export. `backupMaxRows`, je-li uvedeno, u tohoto kroku omezuje také jen filtrovaný výběr. Identity a neviditelné sloupce se odmítají, virtuální sloupce se nevkládají. Pro navázané INSERT kroky uveďte rodiče před dětmi; Oracle kontroluje FK během transakce. Jeden `insert` je jediným krokem pro danou tabulku, nelze jej tedy kombinovat s `delete` téže tabulky.
 
 `maxDeleteRows` je u `replaceTable` nepovinný: při vynechání se smaže celý obsah bez limitu počtu řádků a bez předběžného počítání pro tento limit. Také `maxRows` lze vynechat pro capture bez početního limitu. U filtrovaného kroku `delete` zůstává `maxDeleteRows` povinný. Zadaný `maxDeleteRows` omezuje počet skutečně mazaných řádků po refreshi. Kontroluje se při preflightu i bezprostředně po DELETE v transakci; překročení způsobí rollback schématu. U `replaceTable` musí limit pokrýt také počet zachycených řádků, aby šla obnova zopakovat. `backupMaxRows` u ostatních kroků omezuje velikost zálohy při capture, nikoli rozsah mazání.
 
@@ -138,7 +161,8 @@ Všechna schémata projdou preflightem před prvním zápisem. Pak běží postu
 
 **TRUNCATE se nepoužívá.** Chyba DML nebo vnitřní validace vrátí změny aktuálního schématu. Dříve dokončená schémata zůstanou potvrzená a pozdější se nespustí. Nejde o jednu transakci přes všechna schémata. Při ztrátě spojení právě během COMMIT může být výsledek nejistý; ověřte jej validací nebo obnovu zopakujte se stejným plánem.
 
-Pro příchozí aktivní FK k nahrazované tabulce musí být i dětská tabulka mezi `replaceTable` ve stejném schématu a za rodičem. Vazby z jiných schémat, cykly, samoodkazy a nenahrazované závislé tabulky preflight odmítá. Tyto případy vyžadují samostatný postup DBA; nástroj automaticky nevypíná constraints. Identity a neviditelné sloupce v `replaceTable` se odmítají. Virtuální sloupce se nevkládají a UPDATE nesmí měnit virtuální ani identity sloupce.
+Pro příchozí aktivní FK k nahrazované tabulce musí být i dětská tabulka mezi `replaceTable` ve stejném schématu a za rodičem. Viditelné vazby z jiných schémat, cykly, samoodkazy a nenahrazované závislé tabulky preflight odmítá. Neviditelné externí vazby automaticky ověřit nemůže. Tyto případy vyžadují samostatný postup DBA; nástroj automaticky nevypíná constraints. Identity a neviditelné sloupce v `replaceTable` se odmítají. Virtuální sloupce se nevkládají a UPDATE nesmí měnit virtuální ani identity sloupce.
+
 
 ## Opakování a plán UPDATE
 
@@ -152,7 +176,7 @@ Pokud wrapper oznámí chybu až při samostatné validaci po restore, transakce
 
 ## Zálohy a datové typy
 
-Capture pro každou konfigurovanou tabulku uloží všechny podporované viditelné nevirtuální sloupce do CSV a ručního INSERT SQL. CSV obsahuje příznaky `__IS_NULL`. INSERT soubory se automaticky nespouštějí a neobsahují COMMIT. Jsou určeny pro předem vyprázdněný cíl nebo odstraněné řádky; jejich ruční použití vyžaduje kontrolu identity, FK, triggerů a struktury cíle.
+Capture pro každou konfigurovanou tabulku uloží všechny podporované viditelné nevirtuální sloupce do CSV a ručního INSERT SQL. Krok `insert` exportuje pouze řádky podle `match`; ostatní kroky zálohují celou tabulku. CSV obsahuje příznaky `__IS_NULL`. INSERT soubory se automaticky nespouštějí a neobsahují COMMIT. Jsou určeny pro předem vyprázdněný cíl nebo odstraněné řádky; jejich ruční použití vyžaduje kontrolu identity, FK, triggerů a struktury cíle. Automatická obnova kroku `insert` používá data ze snapshotu a vlastní transakční SQL.
 
 Před `CAPTURE SUCCESS` se snapshot i exporty znovu načtou a porovnají se zachycenými hodnotami a kontrolními součty. Kontrola textu INSERT není důkazem jeho proveditelnosti v libovolném schématu. SHA-256 chrání před náhodnou změnou, nikoli před úmyslným přepsáním dat i součtu. Jednotlivé capture dotazy netvoří společný konzistentní SCN; proto jsou zastavené zápisy nutné.
 

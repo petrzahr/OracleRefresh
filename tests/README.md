@@ -17,9 +17,9 @@ UI testy vytvářejí skutečné Windows Forms ovládací prvky bez zobrazení o
 
 Sada vyžaduje SQL*Plus a Oracle 19c+ s databázovou znakovou sadou podporující češtinu (doporučeno AL32UTF8). **Použijte vyhrazené prázdné testovací schéma s názvem `ORF_TEST_*`.** Testy vytvářejí a mažou vlastní náhodně pojmenované tabulky `ORF_<náhodný identifikátor>_*`, provádějí COMMIT a testují rollback. Neprovádějí DBA refresh a nepracují s aplikačními tabulkami.
 
-Bez nastavení konfigurace lze ověřit přeskočení celé integrační sady: `powershell.exe -NoProfile -File .\tests\Test-OracleIntegration.ps1`. Vypíše `SKIP` pro šest scénářů a nepřipojí se do databáze.
+Bez nastavení konfigurace lze ověřit přeskočení celé integrační sady: `powershell.exe -NoProfile -File .\tests\Test-OracleIntegration.ps1`. Vypíše `SKIP` pro osm scénářů a nepřipojí se do databáze.
 
-DBA musí účtu udělit CREATE SESSION, CREATE TABLE, kvótu v jeho tablespace a přímé SELECT ON SYS.DBA_CONSTRAINTS. Oprávnění k DROP/ALTER vlastních testovacích tabulek vyplývá z vlastnictví. Testovací účet nemá potřebovat přístup k datům aplikací.
+DBA musí účtu udělit CREATE SESSION, CREATE TABLE a kvótu v jeho tablespace. Přístup k SYS.DBA_CONSTRAINTS není potřeba; kontrola používá ALL_CONSTRAINTS a USER_CONSTRAINTS. Oprávnění k DROP/ALTER vlastních testovacích tabulek vyplývá z vlastnictví. Testovací účet nemá potřebovat přístup k datům aplikací. Sada vytváří izolované tabulky bez vazeb z jiných schémat.
 
 Vytvořte lokální `config/integration.json` (Git jej ignoruje):
 
@@ -53,10 +53,14 @@ Scénáře ověřují:
 
 - skutečný capture → změnu dat simulující refresh → preflight → restore → validate;
 - češtinu, národní znaky, apostrofy, ampersand, prázdné řádky, lomítko na samostatném řádku a CRLF;
-- NULL, přesný NUMBER, DATE, TIMESTAMP(9) a TIMESTAMP WITH TIME ZONE;
+- NULL, přesný NUMBER, DATE, TIMESTAMP(9) a TIMESTAMP WITH TIME ZONE včetně kladných, záporných a necelohodinových offsetů;
 - rodičovskou a dětskou tabulku s aktivním FK a opačné pořadí DELETE;
 - UPDATE se stejnou hodnotou v match/set i změnu hodnoty match, následně opakovaný restore;
 - pozdní chybu CHECK constraint po předchozích DML, rollback celého schématu a úspěšné opakování;
-- odmítnutí chybějícího klíče, změny délky sloupce, překročení limitu mazání a chybného cíle.
+- přeskočení chybějícího klíče s recovery výstupem a zachování dodatečných řádků;
+- odmítnutí změny délky sloupce, překročení limitu mazání a chybného cíle;
+- odmítnutí nekonfigurované dětské tabulky s ON DELETE CASCADE před zápisem, se zachováním rodičovských i dětských dat.
+- filtrovaný INSERT celých řádků, provedení exportovaného SQL bez automatického COMMIT, automatické nalezení primárního klíče, opakovaný Restore bez duplicit, zachování dalších řádků a rollback vložených dat;
+- odmítnutí INSERT konfliktu klíče před jakýmkoli zápisem a úspěšnou obnovu po odstranění konfliktu.
 
 Každý test má vlastní tabulky a dočasný adresář snapshotů. Při běžném ukončení se uklidí. Po násilném ukončení procesu mohou zůstat tabulky s prefixem ORF_; uklízejte pouze objekty daného testovacího běhu.
