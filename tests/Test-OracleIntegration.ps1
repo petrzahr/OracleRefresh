@@ -4,7 +4,10 @@ $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/../scripts/OracleRefresh.ps1"
 if (-not $Config) { Write-Host 'SKIP: 8 Oracle integration scenarios; set ORACLE_REFRESH_INTEGRATION_CONFIG for a disposable ORF_TEST_* schema.'; exit 0 }
 $settings = Read-OrfJson ([IO.Path]::GetFullPath($Config))
-$account = $settings['account']; $db = $settings['database']
+$db = Copy-OrfValue $settings
+if ($db['schemaOrder'].Count -ne 1) { throw 'Integration config requires exactly one disposable schema' }
+$account = $db['users'][$db['schemaOrder'][0]]
+$db.Remove('users')
 $user = Get-OrfIdentifier $account['username']
 if (-not $user.StartsWith('ORF_TEST_', [StringComparison]::Ordinal)) { throw 'Integration account must be a disposable ORF_TEST_* schema' }
 if (-not $db.Contains('sqlplusPath')) { $db['sqlplusPath']='sqlplus.exe' }
@@ -52,9 +55,9 @@ COMMIT;
         @{type='update';table=$Fixture.Fixed;key=@('ID');match=@{STATE='TEST'};set=@{STATE='TEST';V=$Fixture.Text;NVAL=$null};expectedRows=1},
         @{type='update';table=$Fixture.Fixed;key=@('ID');match=@{STATE='PROD'};set=@{STATE='TEST';V='Český text'};expectedRows=1},
         @{type='delete';table=$Fixture.Fixed;match=@{STATE='DELETE'};maxDeleteRows=1})
-    Write-OrfText (Join-Path $Fixture.Root 'config/database.json') (ConvertTo-OrfJson $db)
     $users = [ordered]@{}; $users[$user]=$account
-    Write-OrfText (Join-Path $Fixture.Root 'config/credentials.json') (ConvertTo-OrfJson @{users=$users})
+    $connection = Copy-OrfValue $db; $connection['users']=$users
+    Write-OrfText (Join-Path $Fixture.Root 'config/database.json') (ConvertTo-OrfJson $connection)
     Write-OrfText (Join-Path $Fixture.Root "config/schemas/$user.json") (ConvertTo-OrfJson @{steps=$steps})
     $Fixture.Configuration=Get-OrfConfiguration $Fixture.Root
     $Fixture.Path=Invoke-OrfCapture $Fixture.Configuration
@@ -159,11 +162,11 @@ Test-Integration 'Changed column length blocks before replacement' {
     $caught=$false; try { Invoke-OrfRestore $f.Configuration $f.Snapshot $f.State } catch { $caught=$true; Assert-Integration ($_.Exception.Message -match 'layout changed') 'Wrong layout error' }
     Assert-Integration $caught 'Expected layout failure'; Assert-Integration (-not (Test-Path -LiteralPath $f.State)) 'Restore wrote a plan'
 }
-Test-Integration 'Wrong PDB rejected before query' {
+Test-Integration 'Wrong account assertion rejected before query' {
     param($f)
-    $wrong=Copy-OrfValue $db; $wrong['expectedTarget']['conName']='INTENTIONALLY_WRONG'
-    $caught=$false; try { $null=Invoke-OrfSqlPlus $wrong $account "SELECT 1 FROM dual;`n" } catch { $caught=$true; Assert-Integration ($_.Exception.Message -match 'ORA-20010') 'Wrong target guard error' }
-    Assert-Integration $caught 'Expected target failure'
+    $guard=Get-OrfAccountGuard @{username='INTENTIONALLY_WRONG'}
+    $caught=$false; try { $null=Invoke-OrfSqlPlus $db $account ($guard+"SELECT 1 FROM dual;`n") } catch { $caught=$true; Assert-Integration ($_.Exception.Message -match 'ORA-20010') 'Wrong account guard error' }
+    Assert-Integration $caught 'Expected account failure'
 }
 Test-Integration 'Filtered DELETE ceiling blocks before any write' {
     param($f)

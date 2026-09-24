@@ -24,9 +24,8 @@ function New-TestLayout {
 function New-TestConfig($Steps) {
     $root = Join-Path $script:TestRoot ([guid]::NewGuid().ToString('N'))
     [void][IO.Directory]::CreateDirectory((Join-Path $root 'config/schemas'))
-    $db = ConvertFrom-OrfJson '{"tnsAlias":"TESTDB","sqlplusPath":"sqlplus.exe","schemaOrder":["APP"],"expectedTarget":{"dbUniqueName":"TEST","serviceName":"testpdb","conName":"TESTPDB"}}'
+    $db = ConvertFrom-OrfJson '{"host":"TESTDB","sqlplusPath":"sqlplus.exe","schemaOrder":["APP"],"users":{"APP":{"username":"APP","password":"secret&password"}}}'
     Write-OrfText (Join-Path $root 'config/database.json') (ConvertTo-OrfJson $db)
-    Write-OrfText (Join-Path $root 'config/credentials.json') '{"users":{"APP":{"username":"APP","password":"secret&password"}}}'
     Write-OrfText (Join-Path $root 'config/schemas/APP.json') (ConvertTo-OrfJson ([ordered]@{ steps=$Steps }))
     Write-OrfText (Join-Path $root 'config/schemas/APP.example.json') '{}'
     return Get-OrfConfiguration $root
@@ -63,7 +62,7 @@ try {
     Test-Case 'Actual shipped examples load unchanged' {
         $root = Join-Path $script:TestRoot 'examples'; [void][IO.Directory]::CreateDirectory((Join-Path $root 'config/schemas'))
         $repo = Split-Path -Parent $PSScriptRoot
-        foreach ($name in @('database','credentials')) { Copy-Item -LiteralPath (Join-Path $repo "config/$name.example.json") -Destination (Join-Path $root "config/$name.json") }
+        Copy-Item -LiteralPath (Join-Path $repo 'config/database.example.json') -Destination (Join-Path $root 'config/database.json')
         foreach ($file in Get-ChildItem -LiteralPath (Join-Path $repo 'config/schemas') -Filter '*.example.json') {
             Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $root ('config/schemas/' + $file.Name.Replace('.example','')))
         }
@@ -156,16 +155,46 @@ try {
         }
         Assert-Equal (Get-OrfLiteral $null 'TIMESTAMP WITH TIME ZONE') 'NULL'
     }
-    Test-Case 'SQLPlus credentials via stdin and same-session target guard' {
+    Test-Case 'Unified configuration supports TNS and direct connections with validated port' {
+        Assert-Equal (Get-OrfConnectIdentifier @{host='TESTDB'}) 'TESTDB'
+        Assert-Equal (Get-OrfConnectIdentifier @{host='db.example.cz';port=1522;serviceName='testpdb.example.cz'}) '//db.example.cz:1522/testpdb.example.cz'
+        Assert-Equal (Get-OrfConnectIdentifier @{host='localhost';serviceName='XEPDB1'}) '//localhost:1521/XEPDB1'
+        Assert-Equal (Get-OrfConnectIdentifier @{host='//localhost:1521/XEPDB1'}) '//localhost:1521/XEPDB1'
+        foreach ($bad in @("TESTDB`nDELETE FROM T",'host/service as sysdba','host@other','host/service;','')) {
+            Assert-Throws { Get-OrfConnectIdentifier @{host=$bad} } 'Invalid host'
+        }
+        foreach ($bad in @(0,65536,$true,'1521',$null)) {
+            Assert-Throws { Get-OrfConnectIdentifier @{host='localhost';port=$bad;serviceName='XEPDB1'} } 'Invalid Oracle port'
+        }
+        Assert-Throws { Get-OrfConnectIdentifier @{host='TESTDB';port=1521} } 'serviceName is required'
+        Assert-Throws { Get-OrfConnectIdentifier @{host='localhost';serviceName="XEPDB1`nexit"} } 'Invalid serviceName'
+    }
+    Test-Case 'Unified config excludes secrets from fingerprint and binds port and service' {
+        $c=New-TestConfig @(@{type='replaceTable';table='T'})
+        Assert-True (-not (Test-Path (Join-Path $c.Root 'config/credentials.json')))
+        Assert-True (-not $c.Database.Contains('users'))
+        $path=Join-Path $c.Root 'config/database.json'; $raw=Read-OrfJson $path
+        $raw['users']['APP']['password']='rotated-password'; Write-OrfText $path (ConvertTo-OrfJson $raw)
+        Assert-Equal (Get-OrfConfiguration $c.Root).Hash $c.Hash
+        $raw['host']='localhost'; $raw['port']=1521; $raw['serviceName']='XEPDB1'; Write-OrfText $path (ConvertTo-OrfJson $raw)
+        $first=Get-OrfConfiguration $c.Root
+        $raw['port']=1522; Write-OrfText $path (ConvertTo-OrfJson $raw)
+        Assert-True ((Get-OrfConfiguration $c.Root).Hash -cne $first.Hash)
+        $raw['port']=1521; $raw['serviceName']='OTHER'; Write-OrfText $path (ConvertTo-OrfJson $raw)
+        Assert-True ((Get-OrfConfiguration $c.Root).Hash -cne $first.Hash)
+    }
+    Test-Case 'SQLPlus credentials via stdin and same-session account guard' {
         function Invoke-OrfProcess($Executable,$Arguments,$InputText,$TimeoutSeconds) {
             Assert-Equal $Arguments '-L -S /nolog'
             Assert-True ($InputText.IndexOf('set define off') -lt $InputText.IndexOf('connect '))
-            Assert-True ($InputText.IndexOf('DB_UNIQUE_NAME') -lt $InputText.IndexOf('DELETE FROM T'))
-            Assert-True ($InputText.Contains('SERVICE_NAME') -and $InputText.Contains('CON_NAME'))
+            Assert-True ($InputText.IndexOf('SESSION_USER') -lt $InputText.IndexOf('DELETE FROM T'))
+            Assert-True (-not $InputText.Contains('DB_UNIQUE_NAME'))
+            Assert-True ($InputText.Contains('@//localhost:1522/XEPDB1'))
             Assert-True ($InputText.EndsWith("exit rollback`n"))
             return @{ExitCode=0;Output='ok'}
         }
         $c = New-TestConfig @(@{type='replaceTable';table='T'})
+        $c.Database['host']='localhost'; $c.Database['port']=1522; $c.Database['serviceName']='XEPDB1'
         Assert-Equal (Invoke-OrfSqlPlus $c.Database $c.Schemas[0] 'DELETE FROM T;') 'ok'
     }
     Test-Case 'Native errors do not disclose credentials or row values' {
@@ -356,7 +385,7 @@ try {
         Assert-True ($sql.Contains("O''Brien")) 'Quote not escaped'
         Assert-True ($sql.Contains('CHR(13)')) 'Newline not preserved'
         Assert-True ($sql.Contains('WHERE NOT EXISTS')) 'Retry guard missing'
-        Assert-True ($sql.Contains('SYS_CONTEXT')) 'Target guard missing'
+        Assert-True ($sql.Contains('SESSION_USER')) 'Account guard missing'
         Assert-True (-not ($sql -match '(?m)^COMMIT;')) 'Unexpected automatic commit'
         Write-OrfText $csv 'tampered'
         $bad=Join-Path $directory 'bad'

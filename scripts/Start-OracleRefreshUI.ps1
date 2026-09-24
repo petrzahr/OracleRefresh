@@ -26,10 +26,14 @@ $title=New-Object Windows.Forms.Label
 $title.Text='Database Refresh Utility'; $title.Font=New-Object Drawing.Font('Segoe UI',18,[Drawing.FontStyle]::Bold)
 $title.Dock='Fill'; $layout.Controls.Add($title,0,0)
 $target=New-Object Windows.Forms.Label; $target.Dock='Fill'; $target.AutoEllipsis=$true
-$target.Text='Configure config/database.json and config/credentials.json.'
+$target.Text='Configure config/database.json.'
 try {
     $db=ConvertFrom-Json ([IO.File]::ReadAllText((Join-Path $ProjectRoot 'config/database.json')))
-    $target.Text="Target: $($db.tnsAlias)  |  DB: $($db.expectedTarget.dbUniqueName)  |  PDB: $($db.expectedTarget.conName)"
+    $target.Text="Target: $($db.host)  |  Schemas: $($db.schemaOrder -join ', ')"
+    if ($db.serviceName) {
+        $port=1521; if ($null -ne $db.port) { $port=$db.port }
+        $target.Text="Target: $($db.host):$port/$($db.serviceName)  |  Schemas: $($db.schemaOrder -join ', ')"
+    }
 } catch { }
 $layout.Controls.Add($target,0,1)
 $label=New-Object Windows.Forms.Label; $label.Dock='Fill'; $label.Text='Snapshot for preflight, restore and validation:'

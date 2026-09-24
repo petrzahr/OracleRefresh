@@ -9,7 +9,7 @@ powershell.exe -NoProfile -File .\tests\Test-OracleRefresh.ps1
 powershell.exe -NoProfile -STA -File .\tests\Test-OracleRefreshUI.ps1
 ```
 
-Používá se Windows PowerShell 5.1 a vestavěný .NET Framework, bez Pythonu, Pesteru nebo dodatečných modulů. Lokální testy pokrývají načítání příkladů, zachování JSON polí/NULL/řetězců, povinnou konfiguraci, SQL*Plus transport a kontrolu cíle, bezpečné literály, validaci UPDATE přes klíče, volitelné limity, FK pořadí, read-only preflight, capture všech typů kroků a opakování po simulované chybě. Přenos UTF-8 a současné čtení stdout/stderr se ověřují skutečným pomocným procesem PowerShellu; samostatný test vyvolá timeout. Databázové odpovědi jsou v lokálních testech simulované, takže neprokazují chování skutečného Oracle.
+Používá se Windows PowerShell 5.1 a vestavěný .NET Framework, bez Pythonu, Pesteru nebo dodatečných modulů. Lokální testy pokrývají načítání příkladů, zachování JSON polí/NULL/řetězců, povinnou konfiguraci, SQL*Plus transport a kontrolu účtu, bezpečné literály, validaci UPDATE přes klíče, volitelné limity, FK pořadí, read-only preflight, capture všech typů kroků a opakování po simulované chybě. Přenos UTF-8 a současné čtení stdout/stderr se ověřují skutečným pomocným procesem PowerShellu; samostatný test vyvolá timeout. Databázové odpovědi jsou v lokálních testech simulované, takže neprokazují chování skutečného Oracle.
 
 ## Oracle integrační testy
 
@@ -25,23 +25,21 @@ Vytvořte lokální `config/integration.json` (Git jej ignoruje):
 
 ```json
 {
-  "database": {
-    "tnsAlias": "TESTDB",
-    "sqlplusPath": "sqlplus.exe",
-    "expectedTarget": {
-      "dbUniqueName": "TESTDB",
-      "serviceName": "testpdb.example.cz",
-      "conName": "TESTPDB"
+  "host": "localhost",
+  "port": 1521,
+  "serviceName": "XEPDB1",
+  "sqlplusPath": "sqlplus.exe",
+  "schemaOrder": ["ORF_TEST_REFRESH"],
+  "users": {
+    "ORF_TEST_REFRESH": {
+      "username": "ORF_TEST_REFRESH",
+      "password": "DOPLNTE_LOKALNE"
     }
-  },
-  "account": {
-    "username": "ORF_TEST_REFRESH",
-    "password": "DOPLNTE_LOKALNE"
   }
 }
 ```
 
-Hodnoty cíle ověřte nezávisle s DBA. Test s chybným cílem úmyslně očekává odmítnutí připojení před pracovním dotazem.
+Formát je stejný jako `database.json`, pouze s jedním vyhrazeným testovacím schématem. Pro TNS alias použijte například `"host": "TESTDB"` a vynechte `port` i `serviceName`. Test s chybným očekávaným účtem ověřuje odmítnutí před pracovním dotazem. Identitu databáze podle DB_UNIQUE_NAME/CON_NAME sada neověřuje.
 
 ```powershell
 $env:ORACLE_REFRESH_INTEGRATION_CONFIG = (Resolve-Path ./config/integration.json).Path
@@ -58,7 +56,7 @@ Scénáře ověřují:
 - UPDATE se stejnou hodnotou v match/set i změnu hodnoty match, následně opakovaný restore;
 - pozdní chybu CHECK constraint po předchozích DML, rollback celého schématu a úspěšné opakování;
 - přeskočení chybějícího klíče s recovery výstupem a zachování dodatečných řádků;
-- odmítnutí změny délky sloupce, překročení limitu mazání a chybného cíle;
+- odmítnutí změny délky sloupce, překročení limitu mazání a chybného účtu;
 - odmítnutí nekonfigurované dětské tabulky s ON DELETE CASCADE před zápisem, se zachováním rodičovských i dětských dat.
 - filtrovaný INSERT celých řádků, provedení exportovaného SQL bez automatického COMMIT, automatické nalezení primárního klíče, opakovaný Restore bez duplicit, zachování dalších řádků a rollback vložených dat;
 - odmítnutí INSERT konfliktu klíče před jakýmkoli zápisem a úspěšnou obnovu po odstranění konfliktu.

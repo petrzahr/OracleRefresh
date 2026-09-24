@@ -11,35 +11,38 @@ Get-Command sqlplus.exe
 
 ## Konfigurace
 
-1. Zkopírujte `config/database.example.json` na `config/database.json`.
-2. Zkopírujte `config/credentials.example.json` na `config/credentials.json` a doplňte účty.
-3. Zkopírujte požadované `config/schemas/*.example.json` na soubory bez `.example`. Příklady mohou zůstat na místě; při načítání se ignorují.
-4. V `schemaOrder` uveďte všechna používaná schémata právě jednou, v pořadí obnovy. Název `CT.json` vybere účet `CT` z credentials.
+1. Zkopírujte `config/database.example.json` na `config/database.json` a doplňte připojení a hesla. Připojení i účty jsou v tomto jediném souboru.
+2. Zkopírujte požadované `config/schemas/*.example.json` na soubory bez `.example`. Příklady mohou zůstat na místě; při načítání se ignorují.
+3. V `schemaOrder` uveďte všechna používaná schémata právě jednou, v pořadí obnovy. Název `CT.json` vybere účet `users.CT`; jeho `username` musí být `CT`.
 
 ```json
 {
-  "tnsAlias": "TESTDB",
+  "host": "db-server.example.cz",
+  "port": 1521,
+  "serviceName": "testpdb.example.cz",
   "sqlplusPath": "sqlplus.exe",
   "schemaOrder": ["APP1", "APP2", "CT"],
-  "expectedTarget": {
-    "dbUniqueName": "TESTDB",
-    "serviceName": "testpdb.example.cz",
-    "conName": "TESTPDB"
-  },
-  "timeoutSeconds": 300
+  "users": {
+    "APP1": { "username": "APP1", "password": "DOPLNTE_HESLO_APP1" },
+    "APP2": { "username": "APP2", "password": "DOPLNTE_HESLO_APP2" },
+    "CT": { "username": "CT", "password": "DOPLNTE_HESLO_CT" }
+  }
 }
 ```
 
-`expectedTarget` je povinný. Skutečné hodnoty nechte ověřit DBA na cílovém TEST prostředí:
+Pro přímé připojení zadejte `host` (server nebo IP), `port` a `serviceName`. Vynechaný port má výchozí hodnotu 1521. Service name je název služby používaný při připojení, nikoli název uživatele. SQL*Plus dostane adresu ve tvaru `//host:port/serviceName`.
 
-```sql
-SELECT SYS_CONTEXT('USERENV', 'DB_UNIQUE_NAME') AS db_unique_name,
-       SYS_CONTEXT('USERENV', 'SERVICE_NAME') AS service_name,
-       SYS_CONTEXT('USERENV', 'CON_NAME') AS con_name
-FROM dual;
+Pokud používáte existující TNS alias, stačí místo těchto tří polí:
+
+```json
+"host": "TESTDB"
 ```
 
-Každé spojení ověřuje tyto tři hodnoty a přihlášený účet ještě před pracovními dotazy. Porovnání názvů cíle ignoruje velikost písmen. Samotný TNS alias není důkazem identity databáze. Pro non-CDB vyplňte skutečnou vrácenou hodnotu `CON_NAME`. Očekávaný cíl nastavte nezávisle na snapshotu; nenastavujte jej automaticky podle právě připojené databáze.
+U TNS aliasu neuvádějte `port` ani `serviceName`: ty se načtou z nastavení Oracle klienta. `host` přijímá také kompletní adresu `server:1521/service` nebo `//server:1521/service` bez samostatného portu/služby. Samotný název serveru bez služby se vyhodnocuje jako připojovací alias Oracle klienta. `sqlplusPath` může být plná cesta k `sqlplus.exe`; při vynechání se použije `sqlplus.exe` z PATH. Volitelný `timeoutSeconds` má výchozí hodnotu 300.
+
+`expectedTarget`, `dbUniqueName` a `conName` se již nenastavují. Cíl určuje připojení; nástroj nezávisle neověřuje identitu databáze. Každé spojení stále ověřuje přihlášený účet před pracovními dotazy. Snapshot a restore plán jsou vázané na připojovací adresu/alias a konfiguraci kroků; změna serveru, portu či služby vyžaduje nový Capture. Změnu cíle uvnitř stejného TNS aliasu tato vazba nedetekuje.
+
+Při přechodu ze dvou souborů přesuňte objekt `users` z `credentials.json` do `database.json`, přejmenujte `tnsAlias` na `host` (nebo zadejte server/port/službu) a odstraňte `expectedTarget`. Soubor `credentials.json` se již nečte. Před dalším refreshem vytvořte nový Capture; staré snapshoty mají jiný otisk konfigurace. Hesla nejsou součástí otisku, takže jejich změna nový Capture nevyžaduje. `database.json` je ignorovaný Gitem.
 
 Účty používají vlastní tabulky. Kontrola cizích klíčů čte `ALL_CONSTRAINTS` a `USER_CONSTRAINTS`; přístup k `SYS.DBA_CONSTRAINTS` není potřeba. Podporované prostředí nemá příchozí cizí klíče mezi různými schématy. Vazby uvnitř schématu se kontrolují automaticky. Nepřístupné externí vazby tento účet nemusí vidět; jejich nepřítomnost je předpokladem nasazení, nikoli výsledkem kontroly. Aktivní triggery na konfigurovaných tabulkách musí před obnovou vyřešit DBA; nástroj je sám nevypíná.
 
@@ -125,7 +128,7 @@ Klíč se automaticky převezme z aktivního primárního klíče tabulky a ulo�
 
 Při **Restore** se chybějící řádky typu `restoreRows` zapisují samostatně do složky `recovery/<čas-běhu>-<id>/` vedle `snapshot.json`. Každé schéma má soubor `<schema>.skipped-updates.json` s tabulkou, klíčem a původními obnovovanými hodnotami. Záznamy odpovídají UPDATE, které při daném běhu skutečně nezasáhly žádný řádek; nejde jen o výsledek Preflight.
 
-Pokud existují přeskočené řádky, aplikace je dohledá v plné CSV záloze, ověří její SHA-256 a vytvoří `<schema>.missing-rows.insert.sql`. Soubor obsahuje celé původní řádky včetně sloupců mimo `columns` a vloží je pouze tehdy, pokud jejich klíč stále chybí. Skript se automaticky nespouští ani neprovádí COMMIT. Před ručním spuštěním v SQL*Plus pod odpovídajícím schématem zkontrolujte hodnoty a pořadí tabulek podle cizích klíčů; výsledek potvrďte příkazem COMMIT nebo zrušte příkazem ROLLBACK. Kontrola cílové databáze je součástí skriptu. Identity sloupce vyžadují ruční přípravu INSERT; při chybě generování zůstává samostatný log zachovaný a aplikace oznámí, že obnova schématu již byla potvrzena.
+Pokud existují přeskočené řádky, aplikace je dohledá v plné CSV záloze, ověří její SHA-256 a vytvoří `<schema>.missing-rows.insert.sql`. Soubor obsahuje celé původní řádky včetně sloupců mimo `columns` a vloží je pouze tehdy, pokud jejich klíč stále chybí. Skript se automaticky nespouští ani neprovádí COMMIT. Před ručním spuštěním v SQL*Plus pod odpovídajícím schématem zkontrolujte hodnoty a pořadí tabulek podle cizích klíčů; výsledek potvrďte příkazem COMMIT nebo zrušte příkazem ROLLBACK. Kontrola přihlášeného účtu je součástí skriptu. Identity sloupce vyžadují ruční přípravu INSERT; při chybě generování zůstává samostatný log zachovaný a aplikace oznámí, že obnova schématu již byla potvrzena.
 
 Tento výstup platí pro `restoreRows` s `keyValues` i `allRows`. Operace `update` vybírá řádky až po refreshi, takže nemá seznam původních chybějících řádků pro dodatečné vložení.
 
@@ -148,7 +151,7 @@ Operace běží v samostatném PowerShell runspace, takže okno zůstává ovlad
 5. Po `PREFLIGHT SUCCESS` spusťte `./scripts/Restore.ps1 -Snapshot './snapshots/<timestamp>/snapshot.json'`. Restore zopakuje preflight, provede obnovu a wrapper spustí samostatnou validaci.
 6. Validaci lze zopakovat pomocí `./scripts/Validate.ps1 -Snapshot '...'`.
 
-Preflight pouze čte databázi a nevytváří plán obnovy na disku. Kontroluje cíl, strukturu sloupců včetně délek, přesnosti, škály, NULL a identity atributů, existenci a jednoznačnost obnovovaných klíčů, limity mazání, pevně zadávané hodnoty, triggery a závislosti náhrad celých tabulek. Není zkušebním provedením DML: například CHECK constraints se mohou projevit až během transakce, která pak provede rollback.
+Preflight pouze čte databázi a nevytváří plán obnovy na disku. Kontroluje připojení, účet, strukturu sloupců včetně délek, přesnosti, škály, NULL a identity atributů, existenci a jednoznačnost obnovovaných klíčů, limity mazání, pevně zadávané hodnoty, triggery a závislosti náhrad celých tabulek. Není zkušebním provedením DML: například CHECK constraints se mohou projevit až během transakce, která pak provede rollback.
 
 ## Transakce, pořadí a selhání
 

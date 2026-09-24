@@ -106,15 +106,27 @@ function Get-OrfMapping($Value) {
     return ,$result
 }
 
+function Get-OrfConnectIdentifier($Db) {
+    $hostValue = $Db['host']
+    if ($Db.Contains('serviceName')) {
+        if ($hostValue -isnot [string] -or $hostValue -notmatch '\A(?:[A-Za-z0-9_][A-Za-z0-9_.-]*|\[[0-9A-Fa-f:]+\])\z') { throw 'Invalid host name for direct connection' }
+        if ($Db['serviceName'] -isnot [string] -or $Db['serviceName'] -notmatch '\A[A-Za-z0-9_][A-Za-z0-9_.$#-]*\z') { throw 'Invalid serviceName' }
+        $port = 1521; if ($Db.Contains('port')) { $port = $Db['port'] }
+        if (-not (Test-OrfInteger $port) -or $port -lt 1 -or $port -gt 65535) { throw 'Invalid Oracle port' }
+        return ('//{0}:{1}/{2}' -f $hostValue,$port,$Db['serviceName'])
+    }
+    if ($Db.Contains('port')) { throw 'serviceName is required when port is specified; a TNS alias already defines its port and service' }
+    if ($hostValue -isnot [string] -or $hostValue -notmatch '\A(?:[A-Za-z0-9_][A-Za-z0-9_.-]*|(?://)?(?:[A-Za-z0-9_][A-Za-z0-9_.-]*|\[[0-9A-Fa-f:]+\])(?::[0-9]{1,5})?/[A-Za-z0-9_][A-Za-z0-9_.$#-]*)\z') { throw 'Invalid host; use a TNS alias or host:port/service_name' }
+    if ($hostValue -match ':([0-9]+)/' -and ([int]$Matches[1] -lt 1 -or [int]$Matches[1] -gt 65535)) { throw 'Invalid Oracle port' }
+    return $hostValue
+}
+
 function Get-OrfConfiguration([string]$ProjectRoot) {
     $db = Read-OrfJson (Join-Path $ProjectRoot 'config/database.json')
-    $credentials = Read-OrfJson (Join-Path $ProjectRoot 'config/credentials.json')
-    if ($db['tnsAlias'] -isnot [string] -or $db['tnsAlias'] -notmatch '^[A-Za-z0-9_.-]+$') { throw 'Invalid TNS alias' }
-    $target = $db['expectedTarget']
-    if ($target -isnot [System.Collections.IDictionary] -or $target.Count -ne 3) { throw 'expectedTarget is required' }
-    foreach ($name in @('dbUniqueName','serviceName','conName')) {
-        if ($target[$name] -isnot [string] -or $target[$name] -notmatch '^[A-Za-z0-9_.$#-]+$') { throw "Invalid expectedTarget.$name" }
-    }
+    $null = Get-OrfConnectIdentifier $db
+    $users = $db['users']
+    if ($users -isnot [System.Collections.IDictionary] -or $users.Count -eq 0) { throw 'database.json requires a nonempty users object' }
+    $db.Remove('users')
     if (-not $db.Contains('timeoutSeconds')) { $db['timeoutSeconds'] = 300 }
     if (-not (Test-OrfInteger $db['timeoutSeconds']) -or $db['timeoutSeconds'] -le 0 -or $db['timeoutSeconds'] -gt 2147483) { throw 'Invalid timeoutSeconds' }
     if (-not $db.Contains('sqlplusPath')) { $db['sqlplusPath'] = 'sqlplus.exe' }
@@ -134,10 +146,10 @@ function Get-OrfConfiguration([string]$ProjectRoot) {
         if (-not $files.ContainsKey($user)) { throw "Missing schema configuration: $user" }
         $raw = Read-OrfJson $files[$user]
         foreach ($forbidden in @('username','password','objects','fullTables','updates','deletes')) {
-            if ($raw.Contains($forbidden)) { throw 'Schema configuration requires steps; credentials belong in credentials.json' }
+            if ($raw.Contains($forbidden)) { throw 'Schema configuration requires steps; credentials belong in database.json' }
         }
         if ($raw['steps'] -isnot [array] -or $raw['steps'].Count -eq 0) { throw 'Expected nonempty steps array' }
-        $account = $credentials['users'][$user]
+        $account = $users[$user]
         if ($null -eq $account -or $account['username'] -cne $user -or $account['password'] -isnot [string] -or
             $account['password'].Length -eq 0 -or $account['password'] -match '[\r\n\x00]') { throw "Invalid credentials for $user" }
         $steps = @(); $primary = @{}; $fixed = @{}; $tableKeys = @{}
@@ -195,17 +207,12 @@ function Get-OrfConfiguration([string]$ProjectRoot) {
         $publicSchemas += ,([ordered]@{ username = $user; steps = $steps })
         $schemas += ,([ordered]@{ username = $user; password = $account['password']; steps = $steps })
     }
-    $fingerprint = [ordered]@{ tnsAlias = $db['tnsAlias']; expectedTarget = $target; schemaOrder = $order; schemas = $publicSchemas }
+    $fingerprint = [ordered]@{ connection = (Get-OrfConnectIdentifier $db); schemaOrder = $order; schemas = $publicSchemas }
     return @{ Database = $db; Schemas = $schemas; Hash = (Get-OrfDigest $fingerprint); Root = $ProjectRoot }
 }
 
-function Get-OrfTargetGuard($Db, $Account) {
-    $fields = [ordered]@{ dbUniqueName='DB_UNIQUE_NAME'; serviceName='SERVICE_NAME'; conName='CON_NAME' }
-    $terms = foreach ($key in $fields.Keys) {
-        "NVL(UPPER(SYS_CONTEXT('USERENV', '$($fields[$key])')), '?') <> $(Get-OrfQuoted $Db['expectedTarget'][$key].ToUpperInvariant())"
-    }
-    $terms += "SYS_CONTEXT('USERENV', 'SESSION_USER') <> $(Get-OrfQuoted $Account['username'])"
-    "BEGIN IF $($terms -join ' OR ') THEN RAISE_APPLICATION_ERROR(-20010, 'Target database or account mismatch'); END IF; END;`n/`n"
+function Get-OrfAccountGuard($Account) {
+    "BEGIN IF SYS_CONTEXT('USERENV', 'SESSION_USER') <> $(Get-OrfQuoted $Account['username']) THEN RAISE_APPLICATION_ERROR(-20010, 'Connected account mismatch'); END IF; END;`n/`n"
 }
 
 function Invoke-OrfProcess([string]$Executable, [string]$Arguments, [string]$InputText, [int]$TimeoutSeconds) {
@@ -240,19 +247,20 @@ function Invoke-OrfProcess([string]$Executable, [string]$Arguments, [string]$Inp
 }
 
 function Invoke-OrfSqlPlus($Db, $Account, [string]$Sql) {
+    $connectIdentifier = Get-OrfConnectIdentifier $Db
     $password = $Account['password'].Replace('"', '""')
     $header = @"
 whenever oserror exit failure rollback
 whenever sqlerror exit failure rollback
 set define off echo off verify off
-connect $($Account['username'])/"$password"@$($Db['tnsAlias'])
+connect $($Account['username'])/"$password"@$connectIdentifier
 set heading off feedback off verify off echo off define off pagesize 0 linesize 32767 trimspool on tab off
 set sqlblanklines on
 set serveroutput on size unlimited format wrapped
 alter session set nls_numeric_characters='.,';
 alter session set nls_calendar='GREGORIAN';
 "@
-    $inputText = $header + "`n" + (Get-OrfTargetGuard $Db $Account) + $Sql + "`nexit rollback`n"
+    $inputText = $header + "`n" + (Get-OrfAccountGuard $Account) + $Sql + "`nexit rollback`n"
     $result = Invoke-OrfProcess $Db['sqlplusPath'] '-L -S /nolog' $inputText $Db['timeoutSeconds']
     $codes = @([regex]::Matches($result.Output, '(?m)^\s*((?:ORA-|SP2-|PLS-)\d+)') | ForEach-Object { $_.Groups[1].Value })
     if ($result.ExitCode -ne 0 -or $codes.Count -gt 0) { throw "SQL*Plus failed for $($Account['username']): exit $($result.ExitCode); $($codes -join ', ')" }
@@ -655,7 +663,7 @@ function Get-OrfValueChecks($Step, $Layout) {
 function Read-OrfPlan([string]$Path, $Snapshot, $Db) {
     if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
     $wrapper = Read-OrfJson $Path; $plan = $wrapper['plan']
-    if ($wrapper['sha256'] -cne (Get-OrfDigest $plan) -or $plan['snapshotHash'] -cne (Get-OrfDigest $Snapshot) -or -not (Test-OrfEqual $plan['target'] $Db['expectedTarget'])) { throw 'Restore plan checksum/snapshot/target mismatch' }
+    if ($wrapper['sha256'] -cne (Get-OrfDigest $plan) -or $plan['snapshotHash'] -cne (Get-OrfDigest $Snapshot) -or $plan['target'] -cne (Get-OrfConnectIdentifier $Db)) { throw 'Restore plan checksum/snapshot/target mismatch' }
     if ($plan['schemas'].Count -ne $Snapshot['schemas'].Count) { throw 'Restore plan schema count mismatch' }
     return ,$plan
 }
@@ -684,7 +692,7 @@ function Assert-OrfUpdateCount($Step, [long]$Count) {
 function Invoke-OrfPreflight($Configuration, $Snapshot, [string]$StatePath='') {
     $db = $Configuration.Database; $previous = Read-OrfPlan $StatePath $Snapshot $db
     $plan = $previous
-    if ($null -eq $plan) { $plan = [ordered]@{ snapshotHash=(Get-OrfDigest $Snapshot); target=$db['expectedTarget']; schemas=@() } }
+    if ($null -eq $plan) { $plan = [ordered]@{ snapshotHash=(Get-OrfDigest $Snapshot); target=(Get-OrfConnectIdentifier $db); schemas=@() } }
     for ($schemaIndex=0; $schemaIndex -lt $Configuration.Schemas.Count; $schemaIndex++) {
         $cfg = $Configuration.Schemas[$schemaIndex]; $entry = $Snapshot['schemas'][$schemaIndex]
         foreach ($table in $entry['layouts'].Keys) {
@@ -891,7 +899,7 @@ function Write-OrfSkippedRecovery($Entry, $Db, $Account, [string]$Output, [strin
         '-- Connect as the original schema. Review results and COMMIT explicitly; otherwise ROLLBACK.',
         'WHENEVER SQLERROR EXIT FAILURE ROLLBACK', 'WHENEVER OSERROR EXIT FAILURE ROLLBACK',
         'SET DEFINE OFF', 'SET SQLBLANKLINES ON', "ALTER SESSION SET NLS_NUMERIC_CHARACTERS='.,';", "ALTER SESSION SET NLS_CALENDAR='GREGORIAN';",
-        (Get-OrfTargetGuard $Db $Account))
+        (Get-OrfAccountGuard $Account))
     foreach ($record in $records) {
         $table = $record['table']; $step = $Entry['steps'][$record['stepIndex']]
         if (-not $cache.ContainsKey($table)) {

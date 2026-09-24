@@ -1,15 +1,16 @@
 {
-  "tnsAlias": "TESTDB",
+  "host": "db-server.example.cz",
+  "port": 1521,
+  "serviceName": "testpdb.example.cz",
   "sqlplusPath": "sqlplus.exe",
   "schemaOrder": [
     "APP1",
     "APP2",
     "CT"
   ],
-  "expectedTarget": {
-    "dbUniqueName": "TESTDB",
-    "serviceName": "testpdb.example.cz",
-    "conName": "TESTPDB"
-  },
-  "timeoutSeconds": 300
+  "users": {
+    "APP1": { "username": "APP1", "password": "REPLACE_APP1_PASSWORD" },
+    "APP2": { "username": "APP2", "password": "REPLACE_APP2_PASSWORD" },
+    "CT": { "username": "CT", "password": "REPLACE_CT_PASSWORD" }
+  }
 }
