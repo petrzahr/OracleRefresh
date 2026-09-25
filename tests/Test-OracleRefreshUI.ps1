@@ -19,6 +19,7 @@ try {
 function Invoke-OrfAction($Action,$Snapshot,$ProjectRoot) {
     Write-Host 'WORK STARTED'
     Start-Sleep -Milliseconds 250
+    if ($Action -ne 'capture' -and -not (Test-Path -LiteralPath $Snapshot -PathType Leaf)) { throw 'Snapshot not found' }
     if ($Action -eq 'restore') { throw 'SIMULATED RESTORE FAILURE' }
     if ($Action -eq 'validate') { Write-Error 'SIMULATED VALIDATION FAILURE'; return }
     if ($Action -eq 'capture') {
@@ -43,9 +44,9 @@ function Invoke-OrfAction($Action,$Snapshot,$ProjectRoot) {
         Assert-Ui (-not $result.Update.Success) "$action error reported as success"
         Assert-Ui (@($result.Messages | Where-Object { $_.Level -eq 'error' }).Count -gt 0) 'Error stream missing'; $passed++
     }
-    $caught=$false
-    try { $null=Start-OrfUiJob $root 'preflight' (Join-Path $root 'missing.json') } catch { $caught=$true }
-    Assert-Ui $caught 'Missing snapshot was accepted'; $passed++
+    $running=Start-OrfUiJob $root 'preflight' (Join-Path $root 'missing.json')
+    $result=Wait-UiJob $running; $running=$null
+    Assert-Ui (-not $result.Update.Success) 'Missing snapshot was accepted'; $passed++
     # Create real Windows Forms controls without showing a window or touching Oracle.
     $ui=. "$PSScriptRoot/../scripts/Start-OracleRefreshUI.ps1" -NoShow -ProjectRoot $root
     Assert-Ui ($ui.Buttons.Count -eq 4) 'Expected four operation buttons'

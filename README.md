@@ -418,6 +418,24 @@ Každý následující blok je samostatný obsah `config/schemas/APP1.json`. Ná
 
 ## Provozní postup
 
+### Automatický log každého běhu
+
+Capture, Preflight, Restore i Validate automaticky vytvářejí vlastní UTF-8 log v adresáři `logs/` v kořeni projektu. Funguje to při spuštění skriptem i tlačítkem v UI; není potřeba měnit JSON ani ručně použít **Save log**. Cesta se vypíše jako `LOG FILE: ...`.
+
+Název obsahuje UTC čas, jedinečné ID a operaci, například `logs/20260925T1230000000000Z-<id>-restore.log`. Soubory se nepřepisují, automaticky nemažou a jsou ignorované Gitem.
+
+Log začíná před načtením konfigurace a zaznamenává:
+
+- začátek operace, připojovací cíl, schémata a použitý snapshot;
+- jednotlivé kroky Capture a Preflight, počty načtených řádků;
+- začátek a konec každého volání SQL*Plus, délku volání, návratový stav a kódy Oracle chyb;
+- varování, plán obnovy, zahájení transakcí a potvrzené COMMIT jednotlivých schémat;
+- následnou validaci, cesty k recovery výstupům a konečný stav `SUCCESS` nebo `FAILED` s fází chyby a celkovou dobou.
+
+Každý záznam má UTC čas a úroveň `INFO`, `WARNING` nebo `ERROR` a průběžně se zapisuje na disk. Chyba konfigurace či snapshotu se tak zachová také. Pokud nelze log založit, operace nezačne pracovat s databází. Při násilném ukončení procesu může chybět závěrečný `RUN END`; již zapsané události zůstanou. Chyba validace po Restore je výslovně označena jako nastalá **po potvrzení transakcí**.
+
+Hesla, celé SQL příkazy a hodnoty databázových řádků se do provozního logu nezapisují. Podrobnosti chybějících řádků zůstávají v samostatných recovery souborech. Tlačítko **Save log** nadále ukládá viditelný výpis UI; automatický log navíc obsahuje technické události SQL*Plus.
+
 ### Database Refresh Utility
 
 Při **Restore** se chybějící řádky typu `restoreRows` zapisují samostatně do složky `recovery/<čas-běhu>-<id>/` vedle `snapshot.json`. Každé schéma má soubor `<schema>.skipped-updates.json` s tabulkou, klíčem a původními obnovovanými hodnotami. Záznamy odpovídají UPDATE, které při daném běhu skutečně nezasáhly žádný řádek; nejde jen o výsledek Preflight.

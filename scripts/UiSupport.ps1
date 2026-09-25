@@ -4,7 +4,6 @@ function Start-OrfUiJob {
     param([string]$ProjectRoot, [ValidateSet('capture','preflight','restore','validate')][string]$Action, [string]$Snapshot)
     $engine = Join-Path $ProjectRoot 'scripts/OracleRefresh.ps1'
     if (-not (Test-Path -LiteralPath $engine -PathType Leaf)) { throw 'Missing scripts/OracleRefresh.ps1.' }
-    if ($Action -ne 'capture' -and (-not $Snapshot -or -not (Test-Path -LiteralPath $Snapshot -PathType Leaf))) { throw 'Select an existing snapshot.json.' }
     $worker = [PowerShell]::Create()
     $code = {
         param($Engine, $Action, $Snapshot, $Root)

@@ -3,6 +3,26 @@
 $script:OrfUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
 $script:OrfKinds = @('restoreRows', 'replaceTable', 'update', 'delete', 'insert', 'backupTable')
 
+$script:OrfLogPath = $null
+$script:OrfLogSecrets = @()
+
+function Write-OrfMessage {
+    param([string]$Message, [ValidateSet('INFO','WARNING','ERROR')][string]$Level='INFO', [switch]$LogOnly)
+    foreach ($secret in $script:OrfLogSecrets) {
+        if ($secret) { $Message = $Message.Replace($secret, '[REDACTED]') }
+    }
+    # Keep one event per line, even if a path or exception contains a newline.
+    $Message = $Message -replace '[\r\n]+', ' '
+    if ($script:OrfLogPath) {
+        $line = '[{0}] [{1}] {2}{3}' -f [datetime]::UtcNow.ToString('o'),$Level,$Message,[Environment]::NewLine
+        [IO.File]::AppendAllText($script:OrfLogPath, $line, $script:OrfUtf8)
+    }
+    if (-not $LogOnly) {
+        if ($Level -eq 'WARNING') { Write-Warning $Message }
+        else { Write-Host $Message }
+    }
+}
+
 function ConvertTo-OrfMap($Value) {
     if ($null -eq $Value) { return $null }
     if ($Value -is [System.Management.Automation.PSCustomObject]) {
@@ -55,7 +75,10 @@ function ConvertTo-OrfJson($Value) {
     throw 'Unsupported JSON value'
 }
 
-function Read-OrfJson([string]$Path) { ConvertFrom-OrfJson ([IO.File]::ReadAllText($Path, $script:OrfUtf8)) }
+function Read-OrfJson([string]$Path) {
+    try { ConvertFrom-OrfJson ([IO.File]::ReadAllText($Path, $script:OrfUtf8)) }
+    catch { throw "Cannot read or parse JSON file: $Path" }
+}
 function Write-OrfText([string]$Path, [string]$Text) { [IO.File]::WriteAllText($Path, $Text, $script:OrfUtf8) }
 function Get-OrfHash([byte[]]$Bytes) {
     $hash = [Security.Cryptography.SHA256]::Create()
@@ -258,9 +281,20 @@ alter session set nls_numeric_characters='.,';
 alter session set nls_calendar='GREGORIAN';
 "@
     $inputText = $header + "`n" + (Get-OrfAccountGuard $Account) + $Sql + "`nexit rollback`n"
-    $result = Invoke-OrfProcess $Db['sqlplusPath'] '-L -S /nolog' $inputText $Db['timeoutSeconds']
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    Write-OrfMessage "SQLPLUS START account=$($Account['username']) timeout=$($Db['timeoutSeconds'])s" -LogOnly
+    try { $result = Invoke-OrfProcess $Db['sqlplusPath'] '-L -S /nolog' $inputText $Db['timeoutSeconds'] }
+    catch {
+        Write-OrfMessage "SQLPLUS FAILED account=$($Account['username']) elapsedMs=$($watch.ElapsedMilliseconds): $($_.Exception.Message)" -Level ERROR -LogOnly
+        throw
+    }
+    Write-OrfMessage "SQLPLUS END account=$($Account['username']) exit=$($result.ExitCode) elapsedMs=$($watch.ElapsedMilliseconds)" -LogOnly
     $codes = @([regex]::Matches($result.Output, '(?m)^\s*((?:ORA-|SP2-|PLS-)\d+)') | ForEach-Object { $_.Groups[1].Value })
-    if ($result.ExitCode -ne 0 -or $codes.Count -gt 0) { throw "SQL*Plus failed for $($Account['username']): exit $($result.ExitCode); $($codes -join ', ')" }
+    if ($result.ExitCode -ne 0 -or $codes.Count -gt 0) {
+        $message = "SQL*Plus failed for $($Account['username']): exit $($result.ExitCode); $($codes -join ', ')"
+        Write-OrfMessage $message -Level ERROR -LogOnly
+        throw $message
+    }
     return $result.Output
 }
 
@@ -386,6 +420,7 @@ DBMS_OUTPUT.PUT_LINE('COUNT|' || v_count); END;
         if ($line.StartsWith('COUNT|')) { $counts += [long]$line.Substring(6) }
     }
     if ($counts.Count -ne 1 -or $counts[0] -ne $rows.Count) { throw "$Table incomplete row output" }
+    Write-OrfMessage "READ ROWS schema=$($Account['username']) table=$Table count=$($rows.Count)" -LogOnly
     return ,$rows
 }
 
@@ -432,7 +467,7 @@ function Get-OrfSelectedRows($Db, $Account, $Step, $Types, $KeyValues, [switch]$
         $values = [ordered]@{}; for ($i=0; $i -lt $Step['key'].Count; $i++) { $values[$Step['key'][$i]] = $tuple[$i] }
         $found = Get-OrfRows $Db $Account $Step['table'] $Types 1 (Get-OrfPredicate $values $Types)
         if ($found.Count -eq 0 -and $AllowMissing) {
-            Write-Warning "$($Step['table']): skipping missing key $(ConvertTo-OrfJson $values)"
+            Write-OrfMessage "$($Step['table']): skipping missing captured key; details will be in the recovery report" -Level WARNING
             continue
         }
         if ($found.Count -ne 1) { throw "$($Step['table']): missing or duplicate key" }
@@ -536,6 +571,7 @@ function Invoke-OrfCapture($Configuration) {
             $cache = @{}
             foreach ($definition in $cfg['steps']) {
                 $step = Copy-OrfValue $definition; $table = $step['table']; $kind = $step['type']
+                Write-OrfMessage "CAPTURE STEP schema=$($cfg['username']) table=$table type=$kind"
                 if (-not $cache.ContainsKey($table)) {
                     $layout = Get-OrfLayout $db $cfg $table; $types = Get-OrfTypes $layout
                     $where = ''
@@ -581,7 +617,7 @@ function Invoke-OrfCapture($Configuration) {
                     }
                 }
                 $entry['steps'] += ,$step
-                Write-Host "$($cfg['username']).${table}: captured $($rows.Count) backup rows ($kind)"
+                Write-OrfMessage "$($cfg['username']).${table}: captured $($rows.Count) backup rows ($kind)"
             }
             $snapshot['schemas'] += ,$entry
         }
@@ -589,7 +625,7 @@ function Invoke-OrfCapture($Configuration) {
         Write-OrfSnapshot $directory $snapshot
         Write-OrfText (Join-Path $directory 'backups.sha256') (($manifest -join "`n") + "`n")
         Test-OrfCaptureFiles $directory $Configuration $snapshot $inventory
-        Write-Host "CAPTURE SUCCESS: $directory"
+        Write-OrfMessage "CAPTURE SUCCESS: $directory"
         return (Join-Path $directory 'snapshot.json')
     } catch {
         $snapshot['status'] = 'FAILED'; Write-OrfSnapshot $directory $snapshot
@@ -682,6 +718,7 @@ function Invoke-OrfPreflight($Configuration, $Snapshot, [string]$StatePath='') {
         $used = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
         for ($index=0; $index -lt $entry['steps'].Count; $index++) {
             $step = $entry['steps'][$index]; $kind = $step['type']; $table = $step['table']; $layout = $entry['layouts'][$table]
+            Write-OrfMessage "PREFLIGHT STEP schema=$($cfg['username']) step=$index table=$table type=$kind"
             if ($kind -eq 'replaceTable') {
                 foreach ($col in $layout.Values) { if ($col['identity'] -eq 'YES' -or $col['hidden'] -eq 'YES') { throw "$table replacement does not support identity/invisible columns" } }
             }
@@ -736,7 +773,7 @@ function Invoke-OrfPreflight($Configuration, $Snapshot, [string]$StatePath='') {
         }
         if ($null -eq $previous) { $plan['schemas'] += ,$schemaPlan }
     }
-    Write-Host 'PREFLIGHT SUCCESS (read-only database checks)'
+    Write-OrfMessage 'PREFLIGHT SUCCESS (read-only database checks)'
     return ,$plan
 }
 
@@ -888,7 +925,7 @@ function Write-OrfSkippedRecovery($Entry, $Db, $Account, [string]$Output, [strin
     }
     $prefix = Join-Path $ReportDirectory $Entry['username']
     Write-OrfText ($prefix + '.skipped-updates.json') (ConvertTo-OrfJson $records)
-    Write-Host "$($Entry['username']): $($records.Count) skipped updates; log: $prefix.skipped-updates.json"
+    Write-OrfMessage "$($Entry['username']): $($records.Count) skipped updates; log: $prefix.skipped-updates.json"
     if ($records.Count -eq 0) { return }
     # Save the log before reading backups, so a damaged backup never loses the audit.
     $manifest = [IO.File]::ReadAllLines((Join-Path $SnapshotDirectory 'backups.sha256'))
@@ -932,7 +969,7 @@ function Write-OrfSkippedRecovery($Entry, $Db, $Account, [string]$Output, [strin
     }
     $sql += '-- No automatic COMMIT. Review inserted rows, then COMMIT or ROLLBACK.'
     Write-OrfText ($prefix + '.missing-rows.insert.sql') (($sql -join "`n") + "`n")
-    Write-Host "Recovery SQL (not executed): $prefix.missing-rows.insert.sql"
+    Write-OrfMessage "Recovery SQL (not executed): $prefix.missing-rows.insert.sql"
 }
 
 function Invoke-OrfRestore($Configuration, $Snapshot, [string]$StatePath) {
@@ -945,18 +982,24 @@ function Invoke-OrfRestore($Configuration, $Snapshot, [string]$StatePath) {
         $first = -not (Test-Path -LiteralPath $StatePath)
         $plan = Invoke-OrfPreflight $Configuration $Snapshot $StatePath
         Write-OrfPlan $StatePath $plan
+        Write-OrfMessage "RESTORE PLAN path=$StatePath firstAttempt=$first"
         $reportDirectory = Join-Path (Split-Path -Parent $StatePath) ('recovery/' + [datetime]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ') + '-' + [guid]::NewGuid().ToString('N'))
         for ($i=0; $i -lt $Configuration.Schemas.Count; $i++) {
             $account = $Configuration.Schemas[$i]
             $sql = Get-OrfRestoreSql $Snapshot['schemas'][$i] $plan['schemas'][$i] $first
-            $output = Invoke-OrfSqlPlus $Configuration.Database $account $sql
-            Write-Host "$($account['username']): schema transaction committed and validated"
+            Write-OrfMessage "RESTORE TRANSACTION START schema=$($account['username'])"
+            try { $output = Invoke-OrfSqlPlus $Configuration.Database $account $sql }
+            catch {
+                Write-OrfMessage "RESTORE TRANSACTION FAILED schema=$($account['username']); completion not confirmed" -Level ERROR
+                throw
+            }
+            Write-OrfMessage "$($account['username']): schema transaction committed and validated"
             if (@($Snapshot['schemas'][$i]['steps'] | Where-Object { $_['type'] -eq 'restoreRows' }).Count -gt 0) {
                 try { Write-OrfSkippedRecovery $Snapshot['schemas'][$i] $Configuration.Database $account $output (Split-Path -Parent $StatePath) $reportDirectory }
                 catch { throw "Schema $($account['username']) was committed, but recovery report failed: $($_.Exception.Message)" }
             }
         }
-        Write-Host 'RESTORE SUCCESS'
+        Write-OrfMessage 'RESTORE SUCCESS'
     } finally { if ($null -ne $lock) { $lock.Dispose() } }
 }
 
@@ -969,25 +1012,64 @@ function Invoke-OrfValidate($Configuration, $Snapshot, [string]$StatePath) {
         foreach ($table in (Get-OrfRestoreTables $entry)) {
             if (-not (Test-OrfEqual (Get-OrfLayout $Configuration.Database $cfg $table) $entry['layouts'][$table])) { throw "$table layout changed" }
         }
+        Write-OrfMessage "VALIDATE START schema=$($cfg['username'])"
         $sql = Get-OrfValidationSql $entry $schemaPlan
         if (-not $sql) { $sql = 'NULL;' }
         $null = Invoke-OrfSqlPlus $Configuration.Database $cfg "DECLARE v_count NUMBER; BEGIN`n$sql`nEND;`n/`n"
-        Write-Host "$($cfg['username']): all configured results validated"
+        Write-OrfMessage "$($cfg['username']): all configured results validated"
     }
-    Write-Host 'VALIDATION SUCCESS'
+    Write-OrfMessage 'VALIDATION SUCCESS'
 }
 
 function Invoke-OrfAction {
     param([ValidateSet('capture','preflight','restore','validate')][string]$Action,
           [string]$Snapshot, [string]$ProjectRoot=(Split-Path -Parent $PSScriptRoot))
-    $configuration = Get-OrfConfiguration ([IO.Path]::GetFullPath($ProjectRoot))
-    if ($Action -eq 'capture') { $null = Invoke-OrfCapture $configuration; return }
-    if (-not $Snapshot) { throw 'Snapshot path is required' }
-    $path = [IO.Path]::GetFullPath($Snapshot); $snap = Read-OrfSnapshot $path $configuration
-    $state = Join-Path (Split-Path -Parent $path) 'restore-plan.json'
-    switch ($Action) {
-        'preflight' { $null = Invoke-OrfPreflight $configuration $snap $state }
-        'restore' { Invoke-OrfRestore $configuration $snap $state; Invoke-OrfValidate $configuration $snap $state }
-        'validate' { Invoke-OrfValidate $configuration $snap $state }
+    $ErrorActionPreference = 'Stop'
+    $root = [IO.Path]::GetFullPath($ProjectRoot)
+    $directory = Join-Path $root 'logs'
+    [void][IO.Directory]::CreateDirectory($directory)
+    $runId = [datetime]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ') + '-' + [guid]::NewGuid().ToString('N')
+    $script:OrfLogPath = Join-Path $directory ($runId + '-' + $Action + '.log')
+    $script:OrfLogSecrets = @()
+    [IO.File]::WriteAllText($script:OrfLogPath, '', $script:OrfUtf8)
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $phase = 'configuration'
+    try {
+        Write-OrfMessage "RUN START action=$Action id=$runId PowerShell=$($PSVersionTable.PSVersion)"
+        Write-OrfMessage "LOG FILE: $script:OrfLogPath"
+        Write-OrfMessage "CONFIG LOAD root=$root"
+        $configuration = Get-OrfConfiguration $root
+        $script:OrfLogSecrets = @($configuration.Schemas | ForEach-Object { $_['password'] })
+        Write-OrfMessage "CONFIG READY target=$(Get-OrfConnectIdentifier $configuration.Database) schemas=$($configuration.Database['schemaOrder'] -join ',')"
+        if ($Action -eq 'capture') {
+            $phase = 'capture'
+            $null = Invoke-OrfCapture $configuration
+        } else {
+            $phase = 'snapshot'
+            if (-not $Snapshot) { throw 'Snapshot path is required' }
+            $path = [IO.Path]::GetFullPath($Snapshot)
+            Write-OrfMessage "SNAPSHOT LOAD path=$path"
+            $snap = Read-OrfSnapshot $path $configuration
+            Write-OrfMessage "SNAPSHOT VERIFIED version=$($snap['version'])"
+            $state = Join-Path (Split-Path -Parent $path) 'restore-plan.json'
+            $phase = $Action
+            switch ($Action) {
+                'preflight' { $null = Invoke-OrfPreflight $configuration $snap $state }
+                'restore' {
+                    Invoke-OrfRestore $configuration $snap $state
+                    $phase = 'post-restore validation (schema transactions already committed)'
+                    Write-OrfMessage 'POST-RESTORE VALIDATION START'
+                    Invoke-OrfValidate $configuration $snap $state
+                }
+                'validate' { Invoke-OrfValidate $configuration $snap $state }
+            }
+        }
+        Write-OrfMessage "RUN END status=SUCCESS action=$Action elapsedMs=$($watch.ElapsedMilliseconds)"
+    } catch {
+        Write-OrfMessage "RUN END status=FAILED action=$Action phase=$phase elapsedMs=$($watch.ElapsedMilliseconds): $($_.Exception.Message)" -Level ERROR
+        throw
+    } finally {
+        $script:OrfLogPath = $null
+        $script:OrfLogSecrets = @()
     }
 }

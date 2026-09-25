@@ -592,6 +592,64 @@ try {
         $c=New-TestConfig @(@{type='update';table='T';key=@('ID');allRows=$true;set=@{V='x'}}); $s=New-TestSnapshot $c
         Assert-Throws { Invoke-OrfValidate $c $s (Join-Path $c.Root 'missing.json') } 'saved restore plan'
     }
+    Test-Case 'Run logs cover successful capture warnings and redact credentials' {
+        $c=New-TestConfig @(@{type='backupTable';table='T';allRows=$true})
+        function Invoke-OrfCapture($Configuration) {
+            Write-OrfMessage 'STEP START'
+            Write-OrfMessage 'warning secret&password' -Level WARNING
+            Write-OrfMessage 'CAPTURE SUCCESS: test'
+        }
+        Invoke-OrfAction capture -ProjectRoot $c.Root
+        Invoke-OrfAction capture -ProjectRoot $c.Root
+        $files=@(Get-ChildItem -LiteralPath (Join-Path $c.Root 'logs') -Filter '*.log')
+        Assert-Equal $files.Count 2
+        foreach ($file in $files) {
+            $log=[IO.File]::ReadAllText($file.FullName)
+            Assert-True ($log.Contains('RUN START') -and $log.Contains('CONFIG READY') -and $log.Contains('STEP START'))
+            Assert-True ($log.Contains('[WARNING] warning [REDACTED]'))
+            Assert-True (-not $log.Contains('secret&password'))
+            Assert-True ($log.Contains('RUN END status=SUCCESS'))
+        }
+        Assert-Equal $script:OrfLogPath $null
+    }
+    Test-Case 'Configuration failures log from startup without malformed JSON secrets' {
+        $c=New-TestConfig @(@{type='backupTable';table='T';allRows=$true})
+        Write-OrfText (Join-Path $c.Root 'config/database.json') '{"password":"TOP_SECRET", broken}'
+        Assert-Throws { Invoke-OrfAction capture -ProjectRoot $c.Root } 'Cannot read or parse'
+        $file=@(Get-ChildItem -LiteralPath (Join-Path $c.Root 'logs'))[0]
+        $log=[IO.File]::ReadAllText($file.FullName)
+        Assert-True ($log.Contains('RUN START') -and $log.Contains('status=FAILED') -and $log.Contains('phase=configuration'))
+        Assert-True (-not $log.Contains('TOP_SECRET'))
+    }
+    Test-Case 'Restore log includes post-commit validation failure and SQLPlus error codes only' {
+        $c=New-TestConfig @(@{type='replaceTable';table='T';allRows=$true})
+        Write-OrfSnapshot $c.Root (New-TestSnapshot $c)
+        function Invoke-OrfRestore { Write-OrfMessage 'schema transaction committed and validated' }
+        function Invoke-OrfProcess { return @{ExitCode=1;Output="ORA-20012: PRIVATE_ROW secret&password`n"} }
+        function Invoke-OrfValidate($Configuration) { $null=Invoke-OrfSqlPlus $Configuration.Database $Configuration.Schemas[0] 'SELECT 1 FROM dual;' }
+        Assert-Throws { Invoke-OrfAction restore -Snapshot (Join-Path $c.Root 'snapshot.json') -ProjectRoot $c.Root } 'ORA-20012'
+        $log=[IO.File]::ReadAllText(@(Get-ChildItem -LiteralPath (Join-Path $c.Root 'logs'))[0].FullName)
+        Assert-True ($log.Contains('SQLPLUS START') -and $log.Contains('SQLPLUS END') -and $log.Contains('ORA-20012'))
+        Assert-True ($log.Contains('phase=post-restore validation (schema transactions already committed)'))
+        Assert-True (-not $log.Contains('PRIVATE_ROW') -and -not $log.Contains('secret&password'))
+        Assert-True (-not $log.Contains('status=SUCCESS'))
+    }
+    Test-Case 'Real UI worker persists startup failure log' {
+        . "$PSScriptRoot/../scripts/UiSupport.ps1"
+        $c=New-TestConfig @(@{type='backupTable';table='T';allRows=$true})
+        [void][IO.Directory]::CreateDirectory((Join-Path $c.Root 'scripts'))
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../scripts/OracleRefresh.ps1') -Destination (Join-Path $c.Root 'scripts/OracleRefresh.ps1')
+        $job=Start-OrfUiJob $c.Root 'validate' ''
+        $watch=[Diagnostics.Stopwatch]::StartNew()
+        do {
+            $update=Read-OrfUiJob $job
+            if ($watch.Elapsed.TotalSeconds -gt 15) { throw 'UI log test timed out' }
+            if (-not $update.Completed) { Start-Sleep -Milliseconds 20 }
+        } until ($update.Completed)
+        Assert-True (-not $update.Success)
+        $log=[IO.File]::ReadAllText(@(Get-ChildItem -LiteralPath (Join-Path $c.Root 'logs'))[0].FullName)
+        Assert-True ($log.Contains('RUN START action=validate') -and $log.Contains('Snapshot path is required') -and $log.Contains('status=FAILED'))
+    }
     Test-Case 'Direct native UTF-8 transport drains stdout and stderr and times out' {
         # Built-in Windows PowerShell child emulates SQL*Plus pipes, not Oracle.
         $fake = Join-Path $script:TestRoot 'fake-sqlplus.ps1'

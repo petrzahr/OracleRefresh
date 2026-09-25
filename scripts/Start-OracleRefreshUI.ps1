@@ -84,8 +84,7 @@ function Start-OrfUiAction($Ui, [string]$Action) {
     if ($null -ne $Ui.Job) { return }
     try {
         $path=$Ui.Snapshot.Text.Trim()
-        if ($Action -ne 'capture') {
-            if (-not $path) { throw 'Select snapshot.json.' }
+        if ($Action -ne 'capture' -and $path) {
             if (-not [IO.Path]::IsPathRooted($path)) { $path=Join-Path $Ui.Root $path }
             $path=[IO.Path]::GetFullPath($path)
         }

@@ -17,7 +17,7 @@ UI testy vytvářejí skutečné Windows Forms ovládací prvky bez zobrazení o
 
 Sada vyžaduje SQL*Plus a Oracle 19c+ s databázovou znakovou sadou podporující češtinu (doporučeno AL32UTF8). **Použijte vyhrazené prázdné testovací schéma s názvem `ORF_TEST_*`.** Testy vytvářejí a mažou vlastní náhodně pojmenované tabulky `ORF_<náhodný identifikátor>_*`, provádějí COMMIT a testují rollback. Neprovádějí DBA refresh a nepracují s aplikačními tabulkami.
 
-Bez nastavení konfigurace lze ověřit přeskočení celé integrační sady: `powershell.exe -NoProfile -File .\tests\Test-OracleIntegration.ps1`. Vypíše `SKIP` pro deset scénářů a nepřipojí se do databáze. Volitelný parametr `-Scenario 'Scoped unique*'` vybere konkrétní scénář podle názvu.
+Bez nastavení konfigurace lze ověřit přeskočení celé integrační sady: `powershell.exe -NoProfile -File .\tests\Test-OracleIntegration.ps1`. Vypíše `SKIP` pro jedenáct scénářů a nepřipojí se do databáze. Volitelný parametr `-Scenario 'Persistent run logs*'` vybere konkrétní scénář podle názvu.
 
 DBA musí účtu udělit CREATE SESSION, CREATE TABLE a kvótu v jeho tablespace. Přístup k SYS.DBA_CONSTRAINTS není potřeba; kontrola používá ALL_CONSTRAINTS a USER_CONSTRAINTS. Oprávnění k DROP/ALTER vlastních testovacích tabulek vyplývá z vlastnictví. Testovací účet nemá potřebovat přístup k datům aplikací. Sada vytváří izolované tabulky bez vazeb z jiných schémat.
 
@@ -62,5 +62,6 @@ Scénáře ověřují:
 - odmítnutí INSERT konfliktu klíče před jakýmkoli zápisem a úspěšnou obnovu po odstranění konfliktu.
 - zálohu podle klíčů, obnovu složených klíčů bez databázového PK a varianty INSERT/UPDATE/DELETE s `allRows`, včetně smazání nového řádku při opakování DELETE.
 - duplicity a NULL mimo výběr `restoreRows`/`insert`, odmítnutí duplicit ve vybraných identitách a hromadné UPDATE/DELETE/zálohy včetně NULL podmínky; opakování UPDATE zachová násobnost skupiny a změnu počtu odmítne.
+- automatické logy všech čtyř veřejných operací, návaznost COMMIT a validace, přítomnost SQL*Plus událostí a nepřítomnost hesel a hodnot řádků. Lokální testy navíc ověřují log neplatné konfigurace, chyby po COMMIT a skutečný UI runspace.
 
 Každý test má vlastní tabulky a dočasný adresář snapshotů. Při běžném ukončení se uklidí. Po násilném ukončení procesu mohou zůstat tabulky s prefixem ORF_; uklízejte pouze objekty daného testovacího běhu.

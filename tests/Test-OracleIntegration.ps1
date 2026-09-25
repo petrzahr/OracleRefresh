@@ -2,7 +2,7 @@
 param([string]$Config = $env:ORACLE_REFRESH_INTEGRATION_CONFIG, [string]$Scenario = '*')
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/../scripts/OracleRefresh.ps1"
-if (-not $Config) { Write-Host 'SKIP: 10 Oracle integration scenarios; set ORACLE_REFRESH_INTEGRATION_CONFIG for a disposable ORF_TEST_* schema.'; exit 0 }
+if (-not $Config) { Write-Host 'SKIP: 11 Oracle integration scenarios; set ORACLE_REFRESH_INTEGRATION_CONFIG for a disposable ORF_TEST_* schema.'; exit 0 }
 $settings = Read-OrfJson ([IO.Path]::GetFullPath($Config))
 $db = Copy-OrfValue $settings
 if ($db['schemaOrder'].Count -ne 1) { throw 'Integration config requires exactly one disposable schema' }
@@ -298,6 +298,27 @@ Test-Integration 'Scoped unique keys and nonunique group operations' {
     $caught=$false
     try { $null=Invoke-OrfCapture (Get-OrfConfiguration $f.Root) } catch { $caught=$true; Assert-Integration ($_.Exception.Message -match 'unique and non-null') 'Wrong allRows key error' }
     Assert-Integration $caught 'AllRows accepted duplicate/null keys'
+}
+Test-Integration 'Persistent run logs for all public actions' {
+    param($f)
+    Invoke-OrfAction capture -ProjectRoot $f.Root
+    $latest=@(Get-ChildItem -LiteralPath (Join-Path $f.Root 'snapshots') -Directory | Sort-Object Name)[-1]
+    $snapshot=Join-Path $latest.FullName 'snapshot.json'
+    foreach ($action in @('preflight','restore','validate')) {
+        Invoke-OrfAction $action -ProjectRoot $f.Root -Snapshot $snapshot
+    }
+    $logs=@(Get-ChildItem -LiteralPath (Join-Path $f.Root 'logs') -Filter '*.log')
+    Assert-Integration ($logs.Count -eq 4) 'Expected separate log for every action'
+    foreach ($file in $logs) {
+        $log=[IO.File]::ReadAllText($file.FullName)
+        Assert-Integration ($log.Contains('RUN START') -and $log.Contains('RUN END status=SUCCESS')) 'Incomplete run log'
+        Assert-Integration ($log.Contains('SQLPLUS START') -and $log.Contains('SQLPLUS END')) 'SQLPlus activity missing'
+        Assert-Integration (-not $log.Contains($account['password'])) 'Password leaked to run log'
+        Assert-Integration (-not $log.Contains($f.Text)) 'Row data leaked to run log'
+    }
+    $restore=@($logs | Where-Object { $_.Name -like '*-restore.log' })[0]
+    $text=[IO.File]::ReadAllText($restore.FullName)
+    Assert-Integration ($text.IndexOf('schema transaction committed') -lt $text.IndexOf('POST-RESTORE VALIDATION START')) 'Commit and validation ordering missing'
 }
 if ($script:IntegrationCount -eq 0) { throw 'No integration scenario matched' }
 if ($script:IntegrationFailures.Count -gt 0) { throw "$($script:IntegrationFailures.Count) integration failures" }
