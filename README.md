@@ -65,6 +65,7 @@ Mazání proběhne `USERGROUPS → USERS`, vkládání `USERS → USERGROUPS`, v
 
 | Typ | Povinná pole | Chování |
 | --- | --- | --- |
+| `backupTable` | `table` | Pouze zazálohuje celou tabulku do CSV a INSERT SQL při Capture. Preflight, Restore a Validate ji přeskočí. Volitelné `maxRows`, `backupMaxRows` a `expectedRows` kontrolují Capture. |
 | `restoreRows` | `table`, `key`, `columns`, `keyValues` nebo `allRows: true` | Obnoví vybrané sloupce zachycených řádků podle unikátních neprázdných klíčů. `allRows` znamená všechny řádky zachycené před refreshem; další řádky po refreshi ponechá. Chybějící klíče přeskočí s upozorněním; validace kontroluje pouze existující zachycené klíče. Počty řádků před a po refreshi se mohou lišit oběma směry. |
 | `replaceTable` | `table` | Nahradí obsah pomocí transakčních DELETE a INSERT. Volitelné `maxRows` omezuje capture a `expectedRows` vyžaduje přesný počet zachycených řádků. |
 | `update` | `table`, `key`, `set`; volitelně `match` | Nastaví pevné hodnoty v řádcích vybraných až po refreshi. `key` identifikuje řádky pro provedení, opakování i validaci. |
@@ -97,6 +98,18 @@ Mazání proběhne `USERGROUPS → USERS`, vkládání `USERS → USERGROUPS`, v
 ```
 
 Bez `match` UPDATE vybere celou tabulku; `key` je i v tomto případě povinný. `expectedRows` kontroluje počet původně vybraných řádků a platí také při validaci. Bez něj filtrovaný UPDATE vyžaduje alespoň jeden řádek; celotabulkový UPDATE připouští i prázdnou tabulku. `expectedRows: 0` je podporováno.
+
+### Pouze záloha celé tabulky
+
+Do pole `steps` přidejte například:
+
+```json
+{"type": "backupTable", "table": "AUDIT_LOG"}
+```
+
+Spusťte běžný **Capture**. Ve složce snapshotu vzniknou soubory `<SCHÉMA>/AUDIT_LOG.csv` a `<SCHÉMA>/AUDIT_LOG.insert.sql` se všemi řádky a podporovanými uloženými sloupci, včetně kontrolních součtů jako u ostatních záloh. Klíč ani filtr nejsou potřeba. Pro samotné zálohování může konfigurace obsahovat pouze kroky `backupTable`.
+
+Tabulka se automaticky neobnovuje, nekontroluje ani nezamyká při následném Preflight, Restore a Validate. INSERT SQL slouží pro ruční použití a neobsahuje automatický COMMIT. `backupTable` nelze kombinovat s jiným krokem pro stejnou tabulku. Volitelné `maxRows` a `backupMaxRows` omezují počet zálohovaných řádků (platí nižší limit); `expectedRows` vyžaduje přesný počet. Bez limitů se zálohuje celá tabulka, i prázdná.
 
 ### Filtrovaný INSERT
 

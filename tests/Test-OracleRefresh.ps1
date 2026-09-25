@@ -72,6 +72,43 @@ try {
         foreach ($bad in @($null,$true,-1,'100')) { Assert-Throws { $null = New-TestConfig @(@{type='replaceTable';table='T';maxDeleteRows=$bad}) } 'maxDeleteRows' }
     }
     Test-Case 'Filtered delete still requires limit' { Assert-Throws { $null = New-TestConfig @(@{type='delete';table='T';match=@{ID=1}}) } 'maxDeleteRows' }
+    Test-Case 'Backup-only exports full tables and is ignored after capture' {
+        function Get-OrfLayout { New-TestLayout }
+        function Get-OrfRows($Db,$Account,$Table,$Types,$MaxRows,$Where) {
+            Assert-Equal $Where ''; Assert-Equal $MaxRows 2
+            return ,@([ordered]@{ID='1';V='original'},[ordered]@{ID='2';V=$null})
+        }
+        $c=New-TestConfig @(@{type='backupTable';table='ARCHIVE';maxRows=2;expectedRows=2})
+        $path=Invoke-OrfCapture $c; $s=Read-OrfSnapshot $path $c; $entry=$s['schemas'][0]
+        $dir=Split-Path -Parent $path
+        Assert-Equal @(Import-Csv -LiteralPath (Join-Path $dir 'APP/ARCHIVE.csv')).Count 2
+        $sql=[IO.File]::ReadAllText((Join-Path $dir 'APP/ARCHIVE.insert.sql'))
+        Assert-Equal ([regex]::Matches($sql,'INSERT INTO APP.ARCHIVE').Count) 2
+        function Get-OrfLayout { throw 'Backup table must not be inspected after capture' }
+        function Get-OrfCount { throw 'Backup table must not be queried after capture' }
+        function Invoke-OrfSqlPlus($Db,$Account,$Sql) { Assert-True (-not $Sql.Contains('ARCHIVE')) }
+        $plan=Invoke-OrfPreflight $c $s
+        Assert-Equal (Get-OrfValidationSql $entry $plan['schemas'][0]) ''
+        Assert-True (-not (Get-OrfRestoreSql $entry $plan['schemas'][0] $true).Contains('ARCHIVE'))
+        Invoke-OrfValidate $c $s ''
+        $entry['steps'] += ConvertFrom-OrfJson '{"type":"delete","table":"OTHER","match":{"ID":1},"types":{"ID":"NUMBER"},"maxDeleteRows":1}'
+        $restore=Get-OrfRestoreSql $entry $plan['schemas'][0] $true
+        Assert-True ($restore.Contains('LOCK TABLE OTHER') -and $restore.Contains('DELETE FROM OTHER') -and -not $restore.Contains('ARCHIVE'))
+    }
+    Test-Case 'Backup-only accepts empty tables and enforces limits and conflicts' {
+        function Get-OrfLayout { New-TestLayout }
+        function Get-OrfRows { return ,@() }
+        $c=New-TestConfig @(@{type='backupTable';table='T';expectedRows=0})
+        $path=Invoke-OrfCapture $c
+        Assert-Equal @(Import-Csv -LiteralPath (Join-Path (Split-Path -Parent $path) 'APP/T.csv')).Count 0
+        $c=New-TestConfig @(@{type='backupTable';table='T';expectedRows=1})
+        Assert-Throws { Invoke-OrfCapture $c } 'expectedRows mismatch'
+        Assert-Throws { New-TestConfig @(@{type='backupTable';table='T';maxRows=-1}) } 'maxRows'
+        Assert-Throws { New-TestConfig @(@{type='backupTable';table='T';maxRows=1;expectedRows=2}) } 'expectedRows exceeds'
+        foreach ($steps in @(@(@{type='backupTable';table='T'},@{type='replaceTable';table='T'}),@(@{type='replaceTable';table='T'},@{type='backupTable';table='T'}))) {
+            Assert-Throws { New-TestConfig $steps } 'Conflicting'
+        }
+    }
     Test-Case 'INSERT requires a filter and validates optional limits and table conflicts' {
         Assert-Throws { New-TestConfig @(@{type='insert';table='T'}) } 'nonempty'
         Assert-Throws { New-TestConfig @(@{type='insert';table='T';match=@{V='x'};maxInsertRows=-1}) } 'maxInsertRows'

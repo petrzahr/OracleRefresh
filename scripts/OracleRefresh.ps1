@@ -1,7 +1,7 @@
 ﻿#requires -Version 5.1
 # Shared implementation. Dot-source from the four public entry points.
 $script:OrfUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
-$script:OrfKinds = @('restoreRows', 'replaceTable', 'update', 'delete', 'insert')
+$script:OrfKinds = @('restoreRows', 'replaceTable', 'update', 'delete', 'insert', 'backupTable')
 
 function ConvertTo-OrfMap($Value) {
     if ($null -eq $Value) { return $null }
@@ -158,14 +158,14 @@ function Get-OrfConfiguration([string]$ProjectRoot) {
             $kind = $step['type']; $table = Get-OrfIdentifier $step['table']; $step['table'] = $table
             if ($script:OrfKinds -cnotcontains $kind) { throw 'Unsupported step type' }
             foreach ($limit in @('maxRows','backupMaxRows','maxDeleteRows','maxInsertRows','expectedRows')) { Assert-OrfLimit $step $limit }
-            if ($kind -in @('replaceTable','restoreRows','insert')) {
+            if ($kind -in @('replaceTable','restoreRows','insert','backupTable')) {
                 if ($primary.ContainsKey($table) -or $fixed.ContainsKey($table)) { throw 'Conflicting table operations' }
                 $primary[$table] = $true
             } else {
                 if ($primary.ContainsKey($table)) { throw 'Conflicting table operations' }
                 $fixed[$table] = $true
             }
-            if ($kind -eq 'replaceTable') {
+            if ($kind -in @('replaceTable','backupTable')) {
                 if ($step.Contains('maxRows') -and $step.Contains('expectedRows') -and $step['expectedRows'] -gt $step['maxRows']) { throw 'expectedRows exceeds maxRows' }
             }
             if ($kind -eq 'delete') {
@@ -544,7 +544,8 @@ function Invoke-OrfCapture($Configuration) {
                 $step = Copy-OrfValue $definition; $table = $step['table']; $kind = $step['type']
                 if (-not $cache.ContainsKey($table)) {
                     $layout = Get-OrfLayout $db $cfg $table; $types = Get-OrfTypes $layout
-                    $limit = $step['backupMaxRows']; if ($kind -eq 'replaceTable') { $limit = $step['maxRows'] }
+                    $limit = $step['backupMaxRows']; if ($kind -in @('replaceTable','backupTable')) { $limit = $step['maxRows'] }
+                    if ($kind -eq 'backupTable' -and $null -ne $step['backupMaxRows'] -and ($null -eq $limit -or $step['backupMaxRows'] -lt $limit)) { $limit = $step['backupMaxRows'] }
                     $where = ''
                     if ($kind -eq 'insert') {
                         foreach ($col in $layout.Values) { if ($col['identity'] -eq 'YES' -or $col['hidden'] -eq 'YES') { throw "$table insert does not support identity/invisible columns" } }
@@ -569,6 +570,9 @@ function Invoke-OrfCapture($Configuration) {
                 $types = $cache[$table].Types; $rows = $cache[$table].Rows
                 if ($null -ne $step['backupMaxRows'] -and $rows.Count -gt $step['backupMaxRows']) { throw "$table backupMaxRows exceeded" }
                 switch ($kind) {
+                    'backupTable' {
+                        if ($null -ne $step['expectedRows'] -and $rows.Count -ne $step['expectedRows']) { throw "$table expectedRows mismatch" }
+                    }
                     'insert' {
                         if ($null -ne $step['expectedRows'] -and $rows.Count -ne $step['expectedRows']) { throw "$table expectedRows mismatch" }
                         $step['types'] = $types; $step['rows'] = $rows
@@ -689,13 +693,17 @@ function Assert-OrfUpdateCount($Step, [long]$Count) {
         ($null -eq $Step['expectedRows'] -and $Step['match'].Count -gt 0 -and $Count -eq 0)) { throw "$($Step['table']): unexpected UPDATE count" }
 }
 
+function Get-OrfRestoreTables($Entry) {
+    $Entry['steps'] | Where-Object { $_['type'] -ne 'backupTable' } | ForEach-Object { $_['table'] } | Sort-Object -Unique
+}
+
 function Invoke-OrfPreflight($Configuration, $Snapshot, [string]$StatePath='') {
     $db = $Configuration.Database; $previous = Read-OrfPlan $StatePath $Snapshot $db
     $plan = $previous
     if ($null -eq $plan) { $plan = [ordered]@{ snapshotHash=(Get-OrfDigest $Snapshot); target=(Get-OrfConnectIdentifier $db); schemas=@() } }
     for ($schemaIndex=0; $schemaIndex -lt $Configuration.Schemas.Count; $schemaIndex++) {
         $cfg = $Configuration.Schemas[$schemaIndex]; $entry = $Snapshot['schemas'][$schemaIndex]
-        foreach ($table in $entry['layouts'].Keys) {
+        foreach ($table in (Get-OrfRestoreTables $entry)) {
             if (-not (Test-OrfEqual (Get-OrfLayout $db $cfg $table) $entry['layouts'][$table])) { throw "$table layout changed" }
             if ((Get-OrfCount $db $cfg "SELECT COUNT(*) FROM user_triggers WHERE table_name=$(Get-OrfQuoted $table) AND status='ENABLED'") -gt 0) { throw "$table enabled triggers require DBA handling" }
         }
@@ -816,7 +824,7 @@ function Get-OrfValidationSql($Entry, $SchemaPlan) {
 }
 
 function Get-OrfRestoreSql($Entry, $SchemaPlan, [bool]$FirstAttempt) {
-    $statements = @($Entry['layouts'].Keys | Sort-Object | ForEach-Object { "LOCK TABLE $_ IN EXCLUSIVE MODE NOWAIT;" })
+    $statements = @(Get-OrfRestoreTables $Entry | ForEach-Object { "LOCK TABLE $_ IN EXCLUSIVE MODE NOWAIT;" })
     if ($FirstAttempt) {
         for ($index=0; $index -lt $Entry['steps'].Count; $index++) {
             $step = $Entry['steps'][$index]; if ($step['type'] -ne 'update') { continue }
@@ -969,7 +977,7 @@ function Invoke-OrfValidate($Configuration, $Snapshot, [string]$StatePath) {
         $cfg = $Configuration.Schemas[$i]; $entry = $Snapshot['schemas'][$i]
         $schemaPlan = [ordered]@{ updates=[ordered]@{} }
         if ($null -ne $plan) { $schemaPlan = $plan['schemas'][$i] }
-        foreach ($table in $entry['layouts'].Keys) {
+        foreach ($table in (Get-OrfRestoreTables $entry)) {
             if (-not (Test-OrfEqual (Get-OrfLayout $Configuration.Database $cfg $table) $entry['layouts'][$table])) { throw "$table layout changed" }
         }
         $sql = Get-OrfValidationSql $entry $schemaPlan
