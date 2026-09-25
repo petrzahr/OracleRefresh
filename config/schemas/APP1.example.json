@@ -11,17 +11,16 @@
         "CONFIG_VALUE",
         "DESCRIPTIONS"
       ],
-      "keyValues": [
-        [
-          101,
-          "API_URL"
-        ],
-        [
-          102,
-          "ENVIRONMENT"
-        ]
-      ],
-      "expectedRows": 2
+      "match": [
+        {
+          "ID": 101,
+          "CONFIG_KEY": "API_URL"
+        },
+        {
+          "ID": 102,
+          "CONFIG_KEY": "ENVIRONMENT"
+        }
+      ]
     },
     {
       "type": "restoreRows",
@@ -38,24 +37,30 @@
     },
     {
       "type": "replaceTable",
-      "table": "LOOKUP1"
+      "table": "LOOKUP1",
+      "allRows": true
     },
-	    {
+    {
       "type": "replaceTable",
-      "table": "LOOKUP2"
+      "table": "LOOKUP2",
+      "allRows": true
     },
-	    {
+    {
       "type": "replaceTable",
-      "table": "LOOKUP3"
+      "table": "LOOKUP3",
+      "allRows": true
     },
     {
       "type": "delete",
       "table": "TEMP_MESSAGES",
-      "match": {
-        "SOURCE": "PROD",
-        "STATUS": "PENDING"
-      },
-      "maxDeleteRows": 10000
+      "match": [
+        {
+          "MESSAGE_ID": 101
+        }
+      ],
+      "key": [
+        "MESSAGE_ID"
+      ]
     }
   ]
 }

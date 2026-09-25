@@ -1,8 +1,6 @@
-# Ukázka dvou schémat
+# Mazání podle explicitních klíčů nebo celé tabulky
 
-Nejprve připravte `database.json`, `credentials.json` a povinný `expectedTarget` podle [README](README.md). Pro tuto ukázku nastavte `schemaOrder` na `["APP1", "CT"]` a vytvořte pouze odpovídající lokální schema JSON soubory; soubory `.example.json` mohou zůstat.
-
-V `config/schemas/APP1.json`:
+Připojení a účty patří do `config/database.json`. Pro schéma APP1 uveďte `APP1` v `schemaOrder` a vytvořte `config/schemas/APP1.json`.
 
 ```json
 {
@@ -10,44 +8,25 @@ V `config/schemas/APP1.json`:
     {
       "type": "delete",
       "table": "TEMP_MESSAGES",
-      "match": {"SOURCE": "PROD", "STATUS": "PENDING"},
-      "maxDeleteRows": 1000
+      "key": ["MESSAGE_ID"],
+      "match": [{"MESSAGE_ID": 101}, {"MESSAGE_ID": 102}]
     }
   ]
 }
 ```
 
-V `config/schemas/CT.json`:
+`match` obsahuje přesně sloupce z `key`. Obecný filtr nad SOURCE/STATUS se nepoužívá; vyberte konkrétní identifikátory. Chybějící řádky nevadí.
+
+Pro smazání celé tabulky použijte místo předchozího kroku:
 
 ```json
 {
   "steps": [
-    {
-      "type": "update",
-      "table": "CONFIG",
-      "key": ["CONFIG_KEY"],
-      "match": {"CONFIG_KEY": "API_URL"},
-      "set": {"CONFIG_VALUE": "https://api-test.example.cz"},
-      "expectedRows": 1
-    },
-    {
-      "type": "update",
-      "table": "CONFIG",
-      "key": ["CONFIG_KEY"],
-      "match": {"CONFIG_KEY": "CALLBACK_URL"},
-      "set": {"CONFIG_VALUE": "https://callback-test.example.cz", "DESCRIPTIONS": "Test callback"},
-      "expectedRows": 1
-    },
-    {
-      "type": "delete",
-      "table": "CONFIG",
-      "match": {"CONFIG_VALUE": "DUAL_USER"},
-      "maxDeleteRows": 10
-    }
+    {"type": "delete", "table": "TEMP_MESSAGES", "allRows": true}
   ]
 }
 ```
 
-`CONFIG_KEY` musí být neprázdný a unikátní v celé CONFIG. Pokud není, použijte skutečný primární klíč, například `ID`. DELETE nesmí odstranit řádky potřebné pro validaci obou UPDATE; preflight takový překryv odmítne.
+Tato varianta nepotřebuje `key`. Při každém spuštění smaže celý aktuální obsah včetně nově přidaných řádků. DELETE se provádí až po refreshi; Capture uloží úplnou CSV a SQL zálohu tabulky.
 
-Před refreshem capture uloží úplné CSV a SQL zálohy tabulek. Po refreshi nejprve spusťte preflight. Restore uloží klíče cílových UPDATE řádků, provede a ověří DELETE v APP1 a potvrdí transakci APP1. Pak provede oba UPDATE a DELETE v CT, ověří jejich výsledky a potvrdí transakci CT. Pokud CT selže, jeho změny se vrátí, ale potvrzený DELETE v APP1 zůstane. Po odstranění příčiny lze stejnou obnovu zopakovat se zachovaným snapshotem i restore-plan.json.
+Mazání probíhá v transakci schématu a po kontrole výsledků se potvrdí společným COMMIT. DELETE nesmí odstranit řádky potřebné pro validaci UPDATE; preflight překryv odmítne. Další varianty jsou v [CONFIG_EXAMPLES.md](CONFIG_EXAMPLES.md).

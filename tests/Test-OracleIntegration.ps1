@@ -1,8 +1,8 @@
 ﻿#requires -Version 5.1
-param([string]$Config = $env:ORACLE_REFRESH_INTEGRATION_CONFIG)
+param([string]$Config = $env:ORACLE_REFRESH_INTEGRATION_CONFIG, [string]$Scenario = '*')
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/../scripts/OracleRefresh.ps1"
-if (-not $Config) { Write-Host 'SKIP: 8 Oracle integration scenarios; set ORACLE_REFRESH_INTEGRATION_CONFIG for a disposable ORF_TEST_* schema.'; exit 0 }
+if (-not $Config) { Write-Host 'SKIP: 9 Oracle integration scenarios; set ORACLE_REFRESH_INTEGRATION_CONFIG for a disposable ORF_TEST_* schema.'; exit 0 }
 $settings = Read-OrfJson ([IO.Path]::GetFullPath($Config))
 $db = Copy-OrfValue $settings
 if ($db['schemaOrder'].Count -ne 1) { throw 'Integration config requires exactly one disposable schema' }
@@ -14,6 +14,7 @@ if (-not $db.Contains('sqlplusPath')) { $db['sqlplusPath']='sqlplus.exe' }
 if (-not $db.Contains('timeoutSeconds')) { $db['timeoutSeconds']=300 }
 $db['schemaOrder']=@($user)
 $script:IntegrationFailures=@()
+$script:IntegrationCount=0
 
 function Assert-Integration($Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
 function Invoke-FixtureSql([string]$Sql) { $null = Invoke-OrfSqlPlus $db $account ($Sql + "`n") }
@@ -49,12 +50,12 @@ INSERT INTO $($Fixture.Insert) (ID, SOURCE, STATUS, V) VALUES (2, 'TEST', 'PENDI
 COMMIT;
 "@
     $steps = @(
-        @{type='replaceTable';table=$Fixture.Parent}, @{type='replaceTable';table=$Fixture.Child},
+        @{type='replaceTable';allRows=$true;table=$Fixture.Parent}, @{type='replaceTable';allRows=$true;table=$Fixture.Child},
         @{type='restoreRows';table=$Fixture.Settings;key=@('ID');columns=@('V','NV','AMOUNT','D','TS','TZ');allRows=$true},
-        @{type='insert';table=$Fixture.Insert;match=@{SOURCE='PROD';STATUS='PENDING'};maxInsertRows=10;expectedRows=1},
-        @{type='update';table=$Fixture.Fixed;key=@('ID');match=@{STATE='TEST'};set=@{STATE='TEST';V=$Fixture.Text;NVAL=$null};expectedRows=1},
-        @{type='update';table=$Fixture.Fixed;key=@('ID');match=@{STATE='PROD'};set=@{STATE='TEST';V='Český text'};expectedRows=1},
-        @{type='delete';table=$Fixture.Fixed;match=@{STATE='DELETE'};maxDeleteRows=1})
+        @{type='insert';table=$Fixture.Insert;key=@('ID');match=@(@{ID=1})},
+        @{type='update';table=$Fixture.Fixed;key=@('ID');match=@(@{ID=1});set=@{STATE='TEST';V=$Fixture.Text;NVAL=$null}},
+        @{type='update';table=$Fixture.Fixed;key=@('ID');match=@(@{ID=2});set=@{STATE='TEST';V='Český text'}},
+        @{type='delete';table=$Fixture.Fixed;key=@('ID');match=@(@{ID=3})})
     $users = [ordered]@{}; $users[$user]=$account
     $connection = Copy-OrfValue $db; $connection['users']=$users
     Write-OrfText (Join-Path $Fixture.Root 'config/database.json') (ConvertTo-OrfJson $connection)
@@ -78,6 +79,8 @@ COMMIT;
 }
 
 function Test-Integration([string]$Name, [scriptblock]$Body) {
+    if ($Name -notlike $Scenario) { return }
+    $script:IntegrationCount++
     $fixture = @{Created=@()}
     try { Initialize-OracleFixture $fixture; & $Body $fixture; Write-Host "PASS $Name" }
     catch { $script:IntegrationFailures += $Name; Write-Host "FAIL $Name : $($_.Exception.Message)`n$($_.ScriptStackTrace)" }
@@ -98,7 +101,7 @@ Test-Integration 'Unicode NULL numbers timestamps FK and repeated restore' {
     param($f)
     $insertStep=@($f.Snapshot['schemas'][0]['steps'] | Where-Object { $_['type'] -eq 'insert' })[0]
     Assert-Integration ($insertStep['rows'].Count -eq 1) 'INSERT filter captured wrong rows'
-    Assert-Integration ($insertStep['key'][0] -eq 'ID') 'Primary key not discovered'
+    Assert-Integration ($insertStep['key'][0] -eq 'ID') 'Explicit key not preserved'
     $insertFile=Join-Path (Split-Path -Parent $f.Path) ($user+'/'+$f.Insert+'.insert.sql')
     $manual=[IO.File]::ReadAllText($insertFile)
     Assert-Integration (([regex]::Matches($manual,'INSERT INTO').Count) -eq 1) 'Filtered SQL export contains extra rows'
@@ -168,11 +171,13 @@ Test-Integration 'Wrong account assertion rejected before query' {
     $caught=$false; try { $null=Invoke-OrfSqlPlus $db $account ($guard+"SELECT 1 FROM dual;`n") } catch { $caught=$true; Assert-Integration ($_.Exception.Message -match 'ORA-20010') 'Wrong account guard error' }
     Assert-Integration $caught 'Expected account failure'
 }
-Test-Integration 'Filtered DELETE ceiling blocks before any write' {
+Test-Integration 'DELETE removes only explicit keys and preserves other rows' {
     param($f)
     Invoke-FixtureSql "INSERT INTO $($f.Fixed) VALUES (4, 'DELETE', 'p', NULL);`nCOMMIT;"
-    $caught=$false; try { Invoke-OrfRestore $f.Configuration $f.Snapshot $f.State } catch { $caught=$true; Assert-Integration ($_.Exception.Message -match 'maxDeleteRows') 'Wrong delete limit error' }
-    Assert-Integration $caught 'Expected delete limit failure'; Assert-Integration (-not (Test-Path -LiteralPath $f.State)) 'Restore wrote a plan'
+    Invoke-OrfRestore $f.Configuration $f.Snapshot $f.State
+    Invoke-OrfValidate $f.Configuration $f.Snapshot $f.State
+    Assert-Integration ((Get-OrfCount $db $account "SELECT COUNT(*) FROM $($f.Fixed) WHERE ID=3") -eq 0) 'Explicit delete key remains'
+    Assert-Integration ((Get-OrfCount $db $account "SELECT COUNT(*) FROM $($f.Fixed) WHERE ID=4") -eq 1) 'Unselected delete row changed'
 }
 Test-Integration 'Unconfigured cascading child blocks replacement without deleting data' {
     param($f)
@@ -201,5 +206,49 @@ Test-Integration 'INSERT conflicting key blocks all writes and retry succeeds af
     Invoke-OrfRestore $f.Configuration $f.Snapshot $f.State
     Invoke-OrfValidate $f.Configuration $f.Snapshot $f.State
 }
+Test-Integration 'Unified variants with composite keys and allRows' {
+    param($f)
+    $composite=$f.Parent+'_KEYS'
+    Invoke-FixtureSql "CREATE TABLE $composite (TENANT_ID NUMBER, CONFIG_KEY VARCHAR2(30), V VARCHAR2(100));"
+    $f.Created += $composite
+    Invoke-FixtureSql @"
+INSERT INTO $composite VALUES (10, 'API_URL', 'test10');
+INSERT INTO $composite VALUES (20, 'API_URL', 'test20');
+INSERT INTO $composite VALUES (30, 'API_URL', 'test30');
+COMMIT;
+"@
+    $steps=@(
+        @{type='backupTable';table=$f.Parent;key=@('ID');match=@(@{ID=2})},
+        @{type='restoreRows';table=$composite;key=@('TENANT_ID','CONFIG_KEY');match=@(@{TENANT_ID=10;CONFIG_KEY='API_URL'},@{TENANT_ID=20;CONFIG_KEY='API_URL'});columns=@('V')},
+        @{type='insert';table=$f.Insert;key=@('ID');allRows=$true},
+        @{type='update';table=$f.Fixed;key=@('ID');allRows=$true;set=@{STATE='TEST'}},
+        @{type='delete';table=$f.Settings;allRows=$true})
+    Write-OrfText (Join-Path $f.Root "config/schemas/$user.json") (ConvertTo-OrfJson @{steps=$steps})
+    $config=Get-OrfConfiguration $f.Root
+    $path=Invoke-OrfCapture $config; $snapshot=Read-OrfSnapshot $path $config
+    $state=Join-Path (Split-Path -Parent $path) 'restore-plan.json'
+    Assert-Integration ($snapshot['schemas'][0]['steps'][1]['rows'].Count -eq 2) 'Composite capture selected wrong rows'
+    $csv=@(Import-Csv -LiteralPath (Join-Path (Split-Path -Parent $path) "$user/$($f.Parent).csv"))
+    Assert-Integration ($csv.Count -eq 1 -and $csv[0].ID -eq '2') 'Key-filtered backup selected wrong rows'
+    Invoke-FixtureSql @"
+UPDATE $composite SET V='refreshed';
+DELETE FROM $composite WHERE TENANT_ID=20;
+DELETE FROM $($f.Insert) WHERE ID=2;
+COMMIT;
+"@
+    Invoke-OrfRestore $config $snapshot $state
+    Invoke-OrfValidate $config $snapshot $state
+    Assert-Integration ((Get-OrfCount $db $account "SELECT COUNT(*) FROM $composite WHERE TENANT_ID=10 AND V='test10'") -eq 1) 'Composite restore did not restore original value'
+    Assert-Integration ((Get-OrfCount $db $account "SELECT COUNT(*) FROM $composite WHERE TENANT_ID=30 AND V='refreshed'") -eq 1) 'Composite restore changed an unselected row'
+    Assert-Integration ((Get-OrfCount $db $account "SELECT COUNT(*) FROM $composite WHERE TENANT_ID=20") -eq 0) 'Missing composite key was inserted'
+    Assert-Integration ((Get-OrfCount $db $account "SELECT COUNT(*) FROM $($f.Insert) WHERE ID=2") -eq 1) 'AllRows insert did not restore missing row'
+    Assert-Integration ((Get-OrfCount $db $account "SELECT COUNT(*) FROM $($f.Fixed) WHERE STATE='TEST'") -eq 3) 'AllRows update missed rows'
+    Assert-Integration ((Get-OrfCount $db $account "SELECT COUNT(*) FROM $($f.Settings)") -eq 0) 'AllRows delete left rows'
+    Invoke-FixtureSql "INSERT INTO $($f.Settings) (ID,V) VALUES (999,'new');`nCOMMIT;"
+    Invoke-OrfRestore $config $snapshot $state
+    Invoke-OrfValidate $config $snapshot $state
+    Assert-Integration ((Get-OrfCount $db $account "SELECT COUNT(*) FROM $($f.Settings)") -eq 0) 'Repeated allRows delete kept a new row'
+}
+if ($script:IntegrationCount -eq 0) { throw 'No integration scenario matched' }
 if ($script:IntegrationFailures.Count -gt 0) { throw "$($script:IntegrationFailures.Count) integration failures" }
-Write-Host '8/8 Oracle integration scenarios passed'
+Write-Host "$script:IntegrationCount/$script:IntegrationCount Oracle integration scenarios passed"

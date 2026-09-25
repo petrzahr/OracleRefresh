@@ -3,8 +3,7 @@
     {
       "type": "replaceTable",
       "table": "LOOKUP_CHILD",
-      "maxRows": 10000,
-      "maxDeleteRows": 10000
+      "allRows": true
     }
   ]
 }

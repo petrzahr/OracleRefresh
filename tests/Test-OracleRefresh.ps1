@@ -37,7 +37,7 @@ function New-TestSnapshot($Config) {
         $step['types'] = [ordered]@{ ID='NUMBER'; V='VARCHAR2' }
         if ($step['type'] -in @('replaceTable','restoreRows','insert')) { $step['rows'] = @([ordered]@{ ID='1'; V='original' }) }
     }
-    return [ordered]@{ version=3; status='SUCCESS'; configHash=$Config.Hash; schemas=@([ordered]@{ username='APP'; definition=(Copy-OrfValue $Config.Schemas[0]['steps']); layouts=$layouts; steps=$steps }) }
+    return [ordered]@{ version=4; status='SUCCESS'; configHash=$Config.Hash; schemas=@([ordered]@{ username='APP'; definition=(Copy-OrfValue $Config.Schemas[0]['steps']); layouts=$layouts; steps=$steps }) }
 }
 
 try {
@@ -55,8 +55,8 @@ try {
         try { [Threading.Thread]::CurrentThread.CurrentCulture = 'cs-CZ'; Assert-Equal (Get-OrfLiteral ([decimal]1.25) 'NUMBER') '1.25' }
         finally { [Threading.Thread]::CurrentThread.CurrentCulture = $before }
     }
-    Test-Case 'Example files ignored, replacement limits optional' {
-        $config = New-TestConfig @(@{ type='replaceTable'; table='USERS' }, @{ type='replaceTable'; table='USERGROUPS' })
+    Test-Case 'Example files ignored and replacements use explicit allRows' {
+        $config = New-TestConfig @(@{ type='replaceTable'; allRows=$true; table='USERS' }, @{ type='replaceTable'; allRows=$true; table='USERGROUPS' })
         Assert-Equal $config.Schemas.Count 1; Assert-Equal $config.Schemas[0]['steps'].Count 2
     }
     Test-Case 'Actual shipped examples load unchanged' {
@@ -68,17 +68,31 @@ try {
         }
         Assert-Equal (Get-OrfConfiguration $root).Schemas.Count 3
     }
-    Test-Case 'Invalid replacement limits rejected' {
-        foreach ($bad in @($null,$true,-1,'100')) { Assert-Throws { $null = New-TestConfig @(@{type='replaceTable';table='T';maxDeleteRows=$bad}) } 'maxDeleteRows' }
+    Test-Case 'Removed fields are rejected explicitly' {
+        foreach ($field in @('maxRows','backupMaxRows','maxDeleteRows','maxInsertRows','expectedRows','keyValues')) {
+            $step=@{type='replaceTable';table='T';allRows=$true}; $step[$field]=1
+            Assert-Throws { New-TestConfig @($step) } 'Unsupported step field'
+        }
     }
-    Test-Case 'Filtered delete still requires limit' { Assert-Throws { $null = New-TestConfig @(@{type='delete';table='T';match=@{ID=1}}) } 'maxDeleteRows' }
+    Test-Case 'Selection and explicit keys are mandatory and match equals key' {
+        foreach ($kind in @('backupTable','restoreRows','insert','update','delete')) {
+            $step=@{type=$kind;table='T';match=@(@{ID=1})}
+            Assert-Throws { New-TestConfig @($step) } 'column names'
+        }
+        foreach ($selection in @(@{},@{allRows=$false},@{allRows=$true;match=@(@{ID=1})},@{match=@()},@{match=@{ID=1}},@{match=@(@{V='x'})},@{match=@(@{ID=$null})},@{match=@(@{ID=''})},@{match=@(@{ID=1;V='x'})})) {
+            $step=@{type='insert';table='T';key=@('ID')}
+            foreach ($field in $selection.Keys) { $step[$field]=$selection[$field] }
+            Assert-Throws { New-TestConfig @($step) } 'match|allRows|Match'
+        }
+        Assert-Throws { New-TestConfig @(@{type='replaceTable';allRows=$true;table='T';key=@('ID');match=@(@{ID=1})}) } 'Unsupported|requires allRows'
+    }
     Test-Case 'Backup-only exports full tables and is ignored after capture' {
         function Get-OrfLayout { New-TestLayout }
         function Get-OrfRows($Db,$Account,$Table,$Types,$MaxRows,$Where) {
-            Assert-Equal $Where ''; Assert-Equal $MaxRows 2
+            Assert-Equal $Where ''; Assert-Equal $MaxRows $null
             return ,@([ordered]@{ID='1';V='original'},[ordered]@{ID='2';V=$null})
         }
-        $c=New-TestConfig @(@{type='backupTable';table='ARCHIVE';maxRows=2;expectedRows=2})
+        $c=New-TestConfig @(@{type='backupTable';table='ARCHIVE';allRows=$true})
         $path=Invoke-OrfCapture $c; $s=Read-OrfSnapshot $path $c; $entry=$s['schemas'][0]
         $dir=Split-Path -Parent $path
         Assert-Equal @(Import-Csv -LiteralPath (Join-Path $dir 'APP/ARCHIVE.csv')).Count 2
@@ -91,41 +105,40 @@ try {
         Assert-Equal (Get-OrfValidationSql $entry $plan['schemas'][0]) ''
         Assert-True (-not (Get-OrfRestoreSql $entry $plan['schemas'][0] $true).Contains('ARCHIVE'))
         Invoke-OrfValidate $c $s ''
-        $entry['steps'] += ConvertFrom-OrfJson '{"type":"delete","table":"OTHER","match":{"ID":1},"types":{"ID":"NUMBER"},"maxDeleteRows":1}'
+        $entry['steps'] += ConvertFrom-OrfJson '{"type":"delete","table":"OTHER","key":["ID"],"match":[{"ID":1}],"types":{"ID":"NUMBER"}}'
         $restore=Get-OrfRestoreSql $entry $plan['schemas'][0] $true
         Assert-True ($restore.Contains('LOCK TABLE OTHER') -and $restore.Contains('DELETE FROM OTHER') -and -not $restore.Contains('ARCHIVE'))
     }
-    Test-Case 'Backup-only accepts empty tables and enforces limits and conflicts' {
+    Test-Case 'Backup-only accepts empty tables and rejects conflicts' {
         function Get-OrfLayout { New-TestLayout }
         function Get-OrfRows { return ,@() }
-        $c=New-TestConfig @(@{type='backupTable';table='T';expectedRows=0})
+        $c=New-TestConfig @(@{type='backupTable';table='T';allRows=$true})
         $path=Invoke-OrfCapture $c
         Assert-Equal @(Import-Csv -LiteralPath (Join-Path (Split-Path -Parent $path) 'APP/T.csv')).Count 0
-        $c=New-TestConfig @(@{type='backupTable';table='T';expectedRows=1})
-        Assert-Throws { Invoke-OrfCapture $c } 'expectedRows mismatch'
-        Assert-Throws { New-TestConfig @(@{type='backupTable';table='T';maxRows=-1}) } 'maxRows'
-        Assert-Throws { New-TestConfig @(@{type='backupTable';table='T';maxRows=1;expectedRows=2}) } 'expectedRows exceeds'
-        foreach ($steps in @(@(@{type='backupTable';table='T'},@{type='replaceTable';table='T'}),@(@{type='replaceTable';table='T'},@{type='backupTable';table='T'}))) {
+        foreach ($steps in @(@(@{type='backupTable';table='T';allRows=$true},@{type='replaceTable';table='T';allRows=$true}),@(@{type='replaceTable';table='T';allRows=$true},@{type='backupTable';table='T';allRows=$true}))) {
             Assert-Throws { New-TestConfig $steps } 'Conflicting'
         }
     }
-    Test-Case 'INSERT requires a filter and validates optional limits and table conflicts' {
-        Assert-Throws { New-TestConfig @(@{type='insert';table='T'}) } 'nonempty'
-        Assert-Throws { New-TestConfig @(@{type='insert';table='T';match=@{V='x'};maxInsertRows=-1}) } 'maxInsertRows'
-        Assert-Throws { New-TestConfig @(@{type='insert';table='T';match=@{V='x'};maxInsertRows=1;expectedRows=2}) } 'expectedRows exceeds'
-        Assert-Throws { New-TestConfig @(@{type='insert';table='T';match=@{V='x'}},@{type='delete';table='T';match=@{V='x'};maxDeleteRows=1}) } 'Conflicting'
-        $c=New-TestConfig @(@{type='insert';table='T';match=@{V=$null};key=@('id');maxInsertRows=0;expectedRows=0})
-        Assert-Equal $c.Schemas[0]['steps'][0]['key'] @('ID')
+    Test-Case 'AllRows key requirements and table conflicts' {
+        foreach ($kind in @('restoreRows','insert','update')) {
+            Assert-Throws { New-TestConfig @(@{type=$kind;table='T';allRows=$true}) } 'column names'
+        }
+        foreach ($kind in @('backupTable','delete','replaceTable')) {
+            $c=New-TestConfig @(@{type=$kind;table='T';allRows=$true})
+            Assert-True (-not $c.Schemas[0]['steps'][0].Contains('key'))
+            Assert-Throws { New-TestConfig @(@{type=$kind;table='T';allRows=$true;key=@('ID')}) } 'key'
+        }
+        Assert-Throws { New-TestConfig @(@{type='insert';table='T';key=@('ID');allRows=$true},@{type='delete';table='T';allRows=$true}) } 'Conflicting'
     }
-    Test-Case 'INSERT capture exports only filtered full rows and discovers the primary key' {
+    Test-Case 'INSERT capture exports selected full rows using only explicit keys' {
         function Get-OrfLayout { New-TestLayout }
         function Get-OrfCount { 0 }
-        function Invoke-OrfSqlPlus($Db,$Account,$Sql) { Assert-True ($Sql.Contains('user_cons_columns')); return "KEY|ID`n" }
+        function Invoke-OrfSqlPlus($Db,$Account,$Sql) { throw 'Automatic primary-key discovery is forbidden' }
         function Get-OrfRows($Db,$Account,$Table,$Types,$MaxRows,$Where) {
-            Assert-Equal $Where 'V IS NULL'; Assert-Equal $MaxRows 2; Assert-Equal @($Types.Keys) @('ID','V')
+            Assert-Equal $Where '((ID = 7))'; Assert-Equal $MaxRows $null; Assert-Equal @($Types.Keys) @('ID','V')
             return ,@([ordered]@{ID='7';V=$null})
         }
-        $c=New-TestConfig @(@{type='insert';table='T';match=@{V=$null};maxInsertRows=2;expectedRows=1})
+        $c=New-TestConfig @(@{type='insert';table='T';key=@('ID');match=@(@{ID=7})})
         $path=Invoke-OrfCapture $c; $s=Read-OrfSnapshot $path $c; $step=$s['schemas'][0]['steps'][0]
         Assert-Equal $step['key'] @('ID'); Assert-Equal $step['rows'] @([ordered]@{ID='7';V=$null})
         $sql=[IO.File]::ReadAllText((Join-Path (Split-Path -Parent $path) 'APP/T.insert.sql'))
@@ -136,38 +149,106 @@ try {
         Assert-True (-not $restore.Contains('DELETE FROM T'))
         Assert-True ($restore.IndexOf('insert key conflicts') -lt $restore.IndexOf('INSERT INTO T'))
     }
-    Test-Case 'INSERT empty selection stays empty and exact counts are enforced' {
+    Test-Case 'INSERT empty selection stays empty' {
         function Get-OrfLayout { New-TestLayout }
         function Get-OrfCount { 0 }
         function Get-OrfRows { return ,@() }
-        $c=New-TestConfig @(@{type='insert';table='T';match=@{V='x'};key=@('ID');expectedRows=0})
+        $c=New-TestConfig @(@{type='insert';table='T';match=@(@{ID=1});key=@('ID')})
         $path=Invoke-OrfCapture $c; $s=Read-OrfSnapshot $path $c
         Assert-Equal $s['schemas'][0]['steps'][0]['rows'].Count 0
         Assert-True (-not (Get-OrfRestoreSql $s['schemas'][0] @{updates=@{}} $true).Contains('INSERT INTO'))
-        $c=New-TestConfig @(@{type='insert';table='T';match=@{V='x'};key=@('ID');expectedRows=1})
-        Assert-Throws { Invoke-OrfCapture $c } 'expectedRows mismatch'
     }
-    Test-Case 'INSERT rejects missing keys unsupported columns and unknown filter columns' {
+    Test-Case 'INSERT rejects unsupported columns and unknown explicit keys' {
         function Get-OrfLayout { New-TestLayout }
-        function Invoke-OrfSqlPlus { return '' }
-        $c=New-TestConfig @(@{type='insert';table='T';match=@{V='x'}})
-        Assert-Throws { Invoke-OrfCapture $c } 'primary key or an explicit key'
-        $c=New-TestConfig @(@{type='insert';table='T';match=@{UNKNOWN='x'};key=@('ID')})
+        function Get-OrfCount { 0 }
+        $c=New-TestConfig @(@{type='insert';table='T';match=@(@{UNKNOWN=1});key=@('UNKNOWN')})
         Assert-Throws { Invoke-OrfCapture $c } 'Missing column'
         function Get-OrfLayout { $l=New-TestLayout; $l['ID']['identity']='YES'; return $l }
-        $c=New-TestConfig @(@{type='insert';table='T';match=@{V='x'};key=@('ID')})
+        $c=New-TestConfig @(@{type='insert';table='T';match=@(@{ID=1});key=@('ID')})
         Assert-Throws { Invoke-OrfCapture $c } 'identity/invisible'
     }
     Test-Case 'UPDATE requires stable key and prevents changing it' {
-        Assert-Throws { $null = New-TestConfig @(@{type='update';table='T';set=@{V='x'}}) } 'column names'
-        Assert-Throws { $null = New-TestConfig @(@{type='update';table='T';key=@('ID');set=@{ID=2}}) } 'stable key'
+        Assert-Throws { $null = New-TestConfig @(@{type='update';table='T';allRows=$true;set=@{V='x'}}) } 'column names'
+        Assert-Throws { $null = New-TestConfig @(@{type='update';table='T';key=@('ID');allRows=$true;set=@{ID=2}}) } 'stable key'
     }
-    Test-Case 'restoreRows keyValues nesting and optional expectedRows' {
-        $c = New-TestConfig @(@{type='restoreRows';table='T';key=@('ID','V');columns=@('OTHER');keyValues=@(@(101,'API_URL'),@(102,'ENVIRONMENT'))})
-        Assert-Equal $c.Schemas[0]['steps'][0]['keyValues'].Count 2
+    Test-Case 'Composite match normalizes names and deduplicates exact keys' {
+        $c=New-TestConfig @(@{type='restoreRows';table='T';key=@('id','v');columns=@('OTHER');match=@(@{id=101;v='API_URL'},@{V='ENVIRONMENT';ID=102},@{ID=101;V='API_URL'})})
+        $step=$c.Schemas[0]['steps'][0]
+        Assert-Equal $step['key'] @('ID','V'); Assert-Equal $step['match'].Count 2
+        Assert-Equal (Get-OrfSelection $step @{ID='NUMBER';V='VARCHAR2'}) "((ID = 101 AND V = ('API_URL')) OR (ID = 102 AND V = ('ENVIRONMENT')))"
     }
     Test-Case 'Conflicting restore and fixed operations rejected' {
-        Assert-Throws { $null = New-TestConfig @(@{type='replaceTable';table='T'},@{type='delete';table='T';match=@{ID=1};maxDeleteRows=1}) } 'Conflicting'
+        Assert-Throws { $null = New-TestConfig @(@{type='replaceTable';allRows=$true;table='T'},@{type='delete';table='T';key=@('ID');match=@(@{ID=1})}) } 'Conflicting'
+    }
+    Test-Case 'Every documented JSON example loads with the new format' {
+        $doc=[IO.File]::ReadAllText((Join-Path $PSScriptRoot '../CONFIG_EXAMPLES.md'))
+        $blocks=[regex]::Matches($doc,'(?s)```json\s*(.*?)\s*```')
+        Assert-Equal $blocks.Count 14
+        foreach ($block in $blocks) {
+            $example=ConvertFrom-OrfJson $block.Groups[1].Value
+            $null=New-TestConfig $example['steps']
+        }
+    }
+    Test-Case 'Filtered backup exports selected rows and never discovers a primary key' {
+        function Get-OrfLayout { New-TestLayout }
+        function Get-OrfCount { 0 }
+        function Invoke-OrfSqlPlus { throw 'No primary-key discovery or writes during backup' }
+        function Get-OrfRows($Db,$Account,$Table,$Types,$MaxRows,$Where) {
+            Assert-Equal $Where '((ID = 101) OR (ID = 102))'
+            Assert-Equal @($Types.Keys) @('ID','V')
+            return ,@([ordered]@{ID='101';V='one'},[ordered]@{ID='102';V='two'})
+        }
+        $c=New-TestConfig @(@{type='backupTable';table='T';key=@('ID');match=@(@{ID=101},@{ID=102})})
+        $path=Invoke-OrfCapture $c; $s=Read-OrfSnapshot $path $c
+        $csv=@(Import-Csv -LiteralPath (Join-Path (Split-Path -Parent $path) 'APP/T.csv'))
+        Assert-Equal $csv.Count 2; Assert-Equal $csv[1].V 'two'
+        Assert-Equal (Get-OrfValidationSql $s['schemas'][0] @{updates=@{}}) ''
+    }
+    Test-Case 'Composite restore capture selects by OR and restores per-key original values' {
+        function Get-OrfLayout {
+            $l=New-TestLayout; $l['TENANT_ID']=$l['ID']; $l.Remove('ID')
+            $l['CONFIG_KEY']=Copy-OrfValue $l['V']; return $l
+        }
+        function Get-OrfCount { 0 }
+        function Get-OrfRows($Db,$Account,$Table,$Types,$MaxRows,$Where) {
+            if ($Where) { Assert-Equal $Where "((TENANT_ID = 10 AND CONFIG_KEY = ('API_URL')) OR (TENANT_ID = 20 AND CONFIG_KEY = ('API_URL')))" }
+            return ,@([ordered]@{TENANT_ID='10';CONFIG_KEY='API_URL';V='test10'},[ordered]@{TENANT_ID='20';CONFIG_KEY='API_URL';V='test20'})
+        }
+        $c=New-TestConfig @(@{type='restoreRows';table='TENANT_CONFIG';key=@('TENANT_ID','CONFIG_KEY');match=@(@{TENANT_ID=10;CONFIG_KEY='API_URL'},@{TENANT_ID=20;CONFIG_KEY='API_URL'});columns=@('V')})
+        $path=Invoke-OrfCapture $c; $s=Read-OrfSnapshot $path $c
+        $sql=Get-OrfRestoreSql $s['schemas'][0] @{updates=@{}} $true
+        Assert-True ($sql.Contains("UPDATE TENANT_CONFIG SET V = ('test10') WHERE TENANT_ID = 10 AND CONFIG_KEY = ('API_URL');"))
+        Assert-True ($sql.Contains("UPDATE TENANT_CONFIG SET V = ('test20') WHERE TENANT_ID = 20 AND CONFIG_KEY = ('API_URL');"))
+        Assert-True (-not $sql.Contains('DELETE FROM TENANT_CONFIG'))
+        Assert-True (-not $sql.Contains('INSERT INTO TENANT_CONFIG'))
+    }
+    Test-Case 'Empty restore selection is valid and allRows insert captures full rows' {
+        function Get-OrfLayout { New-TestLayout }; function Get-OrfCount { 0 }
+        function Get-OrfRows($Db,$Account,$Table,$Types,$MaxRows,$Where) {
+            if ($Where) { return ,@() }
+            return ,@([ordered]@{ID='1';V='original'})
+        }
+        $c=New-TestConfig @(@{type='restoreRows';table='R';key=@('ID');match=@(@{ID=99});columns=@('V')},@{type='insert';table='I';key=@('ID');allRows=$true})
+        $path=Invoke-OrfCapture $c; $s=Read-OrfSnapshot $path $c
+        Assert-Equal $s['schemas'][0]['steps'][0]['rows'].Count 0
+        Assert-Equal $s['schemas'][0]['steps'][1]['rows'].Count 1
+        $sql=Get-OrfRestoreSql $s['schemas'][0] @{updates=@{}} $true
+        Assert-True (-not $sql.Contains('UPDATE R SET')); Assert-True ($sql.Contains('INSERT INTO I'))
+    }
+    Test-Case 'Duplicate and null explicit keys fail capture and delete preflight' {
+        function Get-OrfLayout { New-TestLayout }
+        function Get-OrfCount($Db,$Account,$Query) {
+            if ($Query.Contains('GROUP BY')) { return 1 }; return 0
+        }
+        function Get-OrfRows { return ,@() }
+        foreach ($kind in @('restoreRows','insert','update','delete','backupTable')) {
+            $step=@{type=$kind;table='T';key=@('ID');match=@(@{ID=1})}
+            if ($kind -eq 'restoreRows') { $step['columns']=@('V') }
+            if ($kind -eq 'update') { $step['set']=@{V='new'} }
+            $c=New-TestConfig @($step)
+            Assert-Throws { Invoke-OrfCapture $c } 'unique and non-null'
+            if ($kind -eq 'delete') { Assert-Throws { Invoke-OrfPreflight $c (New-TestSnapshot $c) } 'unique and non-null' }
+        }
     }
     Test-Case 'SQL literal handles Czech, apostrophes, ampersand, slash, CRLF and emoji' {
         $text = "Příliš žluťoučký`n`n/`nO'Brien & čaj`r`nkonec " + [char]::ConvertFromUtf32(0x1f600)
@@ -207,7 +288,7 @@ try {
         Assert-Throws { Get-OrfConnectIdentifier @{host='localhost';serviceName="XEPDB1`nexit"} } 'Invalid serviceName'
     }
     Test-Case 'Unified config excludes secrets from fingerprint and binds port and service' {
-        $c=New-TestConfig @(@{type='replaceTable';table='T'})
+        $c=New-TestConfig @(@{type='replaceTable';allRows=$true;table='T'})
         Assert-True (-not (Test-Path (Join-Path $c.Root 'config/credentials.json')))
         Assert-True (-not $c.Database.Contains('users'))
         $path=Join-Path $c.Root 'config/database.json'; $raw=Read-OrfJson $path
@@ -230,13 +311,13 @@ try {
             Assert-True ($InputText.EndsWith("exit rollback`n"))
             return @{ExitCode=0;Output='ok'}
         }
-        $c = New-TestConfig @(@{type='replaceTable';table='T'})
+        $c = New-TestConfig @(@{type='replaceTable';allRows=$true;table='T'})
         $c.Database['host']='localhost'; $c.Database['port']=1522; $c.Database['serviceName']='XEPDB1'
         Assert-Equal (Invoke-OrfSqlPlus $c.Database $c.Schemas[0] 'DELETE FROM T;') 'ok'
     }
     Test-Case 'Native errors do not disclose credentials or row values' {
         function Invoke-OrfProcess { @{ExitCode=1;Output="ORA-20010: secret&password private-data`n"} }
-        $c = New-TestConfig @(@{type='replaceTable';table='T'})
+        $c = New-TestConfig @(@{type='replaceTable';allRows=$true;table='T'})
         try { $null = Invoke-OrfSqlPlus $c.Database $c.Schemas[0] ''; throw 'Expected SQL error' }
         catch { Assert-True ($_.Exception.Message.Contains('ORA-20010')); Assert-True ($_.Exception.Message -notmatch 'secret|private') }
     }
@@ -253,7 +334,7 @@ try {
     Test-Case 'Capture verifies snapshot and full backups with NULL and Unicode' {
         function Get-OrfLayout { New-TestLayout }
         function Get-OrfRows { return ,@([ordered]@{ID='1';V="Příliš`r`n`n/`nO'Brien & čaj"}, [ordered]@{ID='2';V=$null}) }
-        $c = New-TestConfig @(@{type='replaceTable';table='T'})
+        $c = New-TestConfig @(@{type='replaceTable';allRows=$true;table='T'})
         $path = Invoke-OrfCapture $c; $snap = Read-OrfSnapshot $path $c
         Assert-Equal $snap['schemas'][0]['steps'][0]['rows'].Count 2
         $csvPath = Join-Path (Split-Path -Parent $path) 'APP/T.csv'
@@ -266,8 +347,8 @@ try {
         function Get-OrfLayout { New-TestLayout }
         function Get-OrfRows($Db,$Account,$Table) { if ($Table -eq 'EMPTY') { return ,@() }; return ,@([ordered]@{ID='1';V='x'}) }
         function Get-OrfCount { 0 }
-        $steps = @(@{type='restoreRows';table='R';key=@('ID');columns=@('V');allRows=$true},@{type='replaceTable';table='EMPTY'},
-            @{type='update';table='U';key=@('ID');set=@{V='target'}},@{type='delete';table='D';match=@{V='x'};maxDeleteRows=5})
+        $steps = @(@{type='restoreRows';table='R';key=@('ID');columns=@('V');allRows=$true},@{type='replaceTable';allRows=$true;table='EMPTY'},
+            @{type='update';table='U';key=@('ID');allRows=$true;set=@{V='target'}},@{type='delete';table='D';key=@('ID');match=@(@{ID=1})})
         $c = New-TestConfig $steps; $path = Invoke-OrfCapture $c; $snap = Read-OrfSnapshot $path $c
         Assert-Equal $snap['schemas'][0]['steps'].Count 4
         Assert-Equal $snap['schemas'][0]['steps'][1]['rows'].Count 0
@@ -275,19 +356,21 @@ try {
     }
     Test-Case 'Failed capture never leaves a successful snapshot' {
         function Get-OrfLayout { throw 'simulated capture failure' }
-        $c = New-TestConfig @(@{type='replaceTable';table='T'})
+        $c = New-TestConfig @(@{type='replaceTable';allRows=$true;table='T'})
         Assert-Throws { Invoke-OrfCapture $c } 'simulated'
         $path = @(Get-ChildItem -LiteralPath (Join-Path $c.Root 'snapshots') -Recurse -Filter snapshot.json)[0].FullName
         Assert-Equal (Read-OrfJson $path)['status'] 'FAILED'
         Assert-Throws { Read-OrfSnapshot $path $c } 'Incomplete'
     }
-    Test-Case 'Old Python snapshot rejected before database work' {
-        $c = New-TestConfig @(@{type='replaceTable';table='T'}); $snap = New-TestSnapshot $c
-        $snap['version']=2; Write-OrfSnapshot $c.Root $snap
-        Assert-Throws { Read-OrfSnapshot (Join-Path $c.Root 'snapshot.json') $c } 'version 3'
+    Test-Case 'All old snapshot versions rejected before database work' {
+        $c = New-TestConfig @(@{type='replaceTable';allRows=$true;table='T'}); $snap = New-TestSnapshot $c
+        foreach ($version in @(1,2,3)) {
+            $snap['version']=$version; Write-OrfSnapshot $c.Root $snap
+            Assert-Throws { Read-OrfSnapshot (Join-Path $c.Root 'snapshot.json') $c } 'version 4'
+        }
     }
     Test-Case 'Changing configuration invalidates an existing snapshot' {
-        $c=New-TestConfig @(@{type='replaceTable';table='T'}); $s=New-TestSnapshot $c
+        $c=New-TestConfig @(@{type='replaceTable';allRows=$true;table='T'}); $s=New-TestSnapshot $c
         Write-OrfSnapshot $c.Root $s; $c.Hash='changed'
         Assert-Throws { Read-OrfSnapshot (Join-Path $c.Root 'snapshot.json') $c } 'configuration'
     }
@@ -304,7 +387,7 @@ try {
         function Get-OrfLayout { New-TestLayout }
         function Get-OrfCount($Db,$Account,$Query) { Assert-True ($Query.Contains('user_triggers')); return 0 }
         function Invoke-OrfSqlPlus($Db,$Account,$Sql) { Assert-True ($Sql.Contains('all_constraints')); Assert-True (-not $Sql.Contains('dba_constraints')); return '' }
-        $c = New-TestConfig @(@{type='replaceTable';table='USERS'},@{type='replaceTable';table='USERGROUPS'})
+        $c = New-TestConfig @(@{type='replaceTable';allRows=$true;table='USERS'},@{type='replaceTable';allRows=$true;table='USERGROUPS'})
         $snap = New-TestSnapshot $c; $state = Join-Path $c.Root 'restore-plan.json'
         $plan = Invoke-OrfPreflight $c $snap $state; Assert-True (-not (Test-Path -LiteralPath $state))
         $sql = Get-OrfRestoreSql $snap['schemas'][0] $plan['schemas'][0] $true
@@ -316,14 +399,14 @@ try {
         Assert-True ($sql.Contains('EXCEPTION WHEN OTHERS THEN ROLLBACK;'))
     }
     Test-Case 'FK parent-child accepted and visible external reference rejected' {
-        $c = New-TestConfig @(@{type='replaceTable';table='USERS'},@{type='replaceTable';table='USERGROUPS'}); $s = New-TestSnapshot $c
+        $c = New-TestConfig @(@{type='replaceTable';allRows=$true;table='USERS'},@{type='replaceTable';allRows=$true;table='USERGROUPS'}); $s = New-TestSnapshot $c
         function Invoke-OrfSqlPlus { "FK|APP|USERGROUPS|USERS`n" }
         Assert-OrfDependencies $c.Database $c.Schemas[0] $s['schemas'][0]
         function Invoke-OrfSqlPlus { "FK|OTHER|USERGROUPS|USERS`n" }
         Assert-Throws { Assert-OrfDependencies $c.Database $c.Schemas[0] $s['schemas'][0] } 'FK requires'
     }
     Test-Case 'FK unconfigured children self references and reversed order rejected' {
-        $c = New-TestConfig @(@{type='replaceTable';table='USERS'},@{type='replaceTable';table='USERGROUPS'}); $s = New-TestSnapshot $c
+        $c = New-TestConfig @(@{type='replaceTable';allRows=$true;table='USERS'},@{type='replaceTable';allRows=$true;table='USERGROUPS'}); $s = New-TestSnapshot $c
         foreach ($line in @('FK|APP|OTHER_CHILD|USERS','FK|APP|USERS|USERS','FK|APP|USERS|USERGROUPS')) {
             function Invoke-OrfSqlPlus { return $line }
             Assert-Throws { Assert-OrfDependencies $c.Database $c.Schemas[0] $s['schemas'][0] } 'FK requires'
@@ -332,13 +415,13 @@ try {
     Test-Case 'Layout narrowing stops preflight before writes' {
         function Get-OrfLayout { $l=New-TestLayout; $l['V']['chars']=20; return $l }
         function Invoke-OrfSqlPlus { throw 'unexpected database write' }
-        $c = New-TestConfig @(@{type='replaceTable';table='T'}); $s = New-TestSnapshot $c
+        $c = New-TestConfig @(@{type='replaceTable';allRows=$true;table='T'}); $s = New-TestSnapshot $c
         Assert-Throws { Invoke-OrfPreflight $c $s } 'layout changed'
     }
     Test-Case 'Identity columns and enabled triggers block preflight' {
         function Get-OrfLayout { $l=New-TestLayout; $l['ID']['identity']='YES'; return $l }
         function Get-OrfCount { 0 }; function Invoke-OrfSqlPlus { '' }
-        $c=New-TestConfig @(@{type='replaceTable';table='T'}); $s=New-TestSnapshot $c
+        $c=New-TestConfig @(@{type='replaceTable';allRows=$true;table='T'}); $s=New-TestSnapshot $c
         $s['schemas'][0]['layouts']['T']['ID']['identity']='YES'
         Assert-Throws { Invoke-OrfPreflight $c $s } 'identity'
         function Get-OrfLayout { New-TestLayout }; function Get-OrfCount { 1 }
@@ -354,23 +437,22 @@ try {
     Test-Case 'Overlapping UPDATE keys rejected' {
         function Get-OrfLayout { New-TestLayout }; function Get-OrfCount { 0 }; function Invoke-OrfSqlPlus { '' }
         function Get-OrfRows { return ,@([ordered]@{ID='1'}) }
-        $c=New-TestConfig @(@{type='update';table='T';key=@('ID');set=@{V='A'}},@{type='update';table='T';key=@('ID');set=@{V='B'}})
+        $c=New-TestConfig @(@{type='update';table='T';key=@('ID');allRows=$true;set=@{V='A'}},@{type='update';table='T';key=@('ID');allRows=$true;set=@{V='B'}})
         $s=New-TestSnapshot $c; Assert-Throws { Invoke-OrfPreflight $c $s } 'overlapping'
     }
     Test-Case 'DELETE that would remove an UPDATE row is rejected' {
         function Get-OrfLayout { New-TestLayout }; function Invoke-OrfSqlPlus { '' }
         function Get-OrfRows { return ,@([ordered]@{ID='1'}) }
         function Get-OrfCount($Db,$Account,$Query) { if ($Query.Contains('WHERE ID = 1 AND')) { return 1 }; return 0 }
-        $c=New-TestConfig @(@{type='update';table='T';key=@('ID');set=@{V='A'}},@{type='delete';table='T';match=@{V='A'};maxDeleteRows=10})
+        $c=New-TestConfig @(@{type='update';table='T';key=@('ID');allRows=$true;set=@{V='A'}},@{type='delete';table='T';key=@('ID');match=@(@{ID=1})})
         $s=New-TestSnapshot $c; Assert-Throws { Invoke-OrfPreflight $c $s } 'overlaps'
     }
-    Test-Case 'Explicit replacement ceiling retained' {
-        function Get-OrfLayout { New-TestLayout }
-        function Invoke-OrfSqlPlus { '' }
-        function Get-OrfCount($Db,$Account,$Query) { if ($Query.Contains('user_triggers')) { return 0 }; return 11 }
-        $c = New-TestConfig @(@{type='replaceTable';table='T';maxDeleteRows=10}); $s = New-TestSnapshot $c
-        Assert-Throws { Invoke-OrfPreflight $c $s } 'maxDeleteRows'
-        Assert-True ((Get-OrfRestoreSql $s['schemas'][0] @{updates=@{}} $true).Contains('SQL%ROWCOUNT > 10'))
+    Test-Case 'DELETE allRows has no key or row ceiling and validates empty table' {
+        $c=New-TestConfig @(@{type='delete';table='T';allRows=$true}); $s=New-TestSnapshot $c
+        $sql=Get-OrfRestoreSql $s['schemas'][0] @{updates=@{}} $true
+        Assert-True ($sql.Contains('DELETE FROM T;'))
+        Assert-True ($sql.Contains('SELECT 1 FROM T WHERE 1=1'))
+        Assert-True (-not $sql.Contains('SQL%ROWCOUNT >'))
     }
     Test-Case 'Missing restore key is skipped with a warning' {
         function Get-OrfLayout { New-TestLayout }; function Get-OrfCount { 0 }
@@ -438,7 +520,7 @@ try {
     Test-Case 'UPDATE stable keys persisted before failure and reused on retry' {
         function Get-OrfLayout { New-TestLayout }; function Get-OrfCount { 0 }
         function Get-OrfRows { return ,@([ordered]@{ID='42'}) }
-        $c = New-TestConfig @(@{type='update';table='T';key=@('ID');match=@{V='TEST'};set=@{V='TEST'};expectedRows=1})
+        $c = New-TestConfig @(@{type='update';table='T';key=@('ID');match=@(@{ID=42});set=@{V='TEST'}})
         $s=New-TestSnapshot $c; $state=Join-Path $c.Root 'restore-plan.json'
         function Invoke-OrfSqlPlus($Db,$Account,$Sql) {
             if ($Sql.Contains('COMMIT;')) { Assert-True (Test-Path -LiteralPath $state); throw 'simulated lost acknowledgement' }; return ''
@@ -453,13 +535,18 @@ try {
         $raw = Read-OrfJson $state; $raw['plan']['snapshotHash']='wrong'; Write-OrfText $state (ConvertTo-OrfJson $raw)
         Assert-Throws { Read-OrfPlan $state $s $c.Database } 'mismatch'
     }
-    Test-Case 'UPDATE expectedRows zero valid and wrong count rejected' {
-        $step = @{table='T';expectedRows=0;match=@{V='x'}}
-        Assert-OrfUpdateCount $step 0; Assert-Throws { Assert-OrfUpdateCount $step 1 } 'count'
+    Test-Case 'Empty UPDATE selection is planned and remains valid on retry' {
+        function Get-OrfLayout { New-TestLayout }; function Get-OrfCount { 0 }; function Invoke-OrfSqlPlus { '' }
+        function Get-OrfRows { return ,@() }
+        $c=New-TestConfig @(@{type='update';table='T';key=@('ID');match=@(@{ID=99});set=@{V='x'}}); $s=New-TestSnapshot $c
+        $plan=Invoke-OrfPreflight $c $s
+        Assert-Equal $plan['schemas'][0]['updates']['0']['rows'].Count 0
+        $sql=Get-OrfRestoreSql $s['schemas'][0] $plan['schemas'][0] $true
+        Assert-True (-not $sql.Contains('UPDATE T SET'))
     }
     Test-Case 'Separate UPDATE validation requires saved plan' {
         function Get-OrfLayout { New-TestLayout }
-        $c=New-TestConfig @(@{type='update';table='T';key=@('ID');set=@{V='x'}}); $s=New-TestSnapshot $c
+        $c=New-TestConfig @(@{type='update';table='T';key=@('ID');allRows=$true;set=@{V='x'}}); $s=New-TestSnapshot $c
         Assert-Throws { Invoke-OrfValidate $c $s (Join-Path $c.Root 'missing.json') } 'saved restore plan'
     }
     Test-Case 'Direct native UTF-8 transport drains stdout and stderr and times out' {
