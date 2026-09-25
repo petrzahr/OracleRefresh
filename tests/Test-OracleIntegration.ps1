@@ -2,7 +2,7 @@
 param([string]$Config = $env:ORACLE_REFRESH_INTEGRATION_CONFIG, [string]$Scenario = '*')
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/../scripts/OracleRefresh.ps1"
-if (-not $Config) { Write-Host 'SKIP: 9 Oracle integration scenarios; set ORACLE_REFRESH_INTEGRATION_CONFIG for a disposable ORF_TEST_* schema.'; exit 0 }
+if (-not $Config) { Write-Host 'SKIP: 10 Oracle integration scenarios; set ORACLE_REFRESH_INTEGRATION_CONFIG for a disposable ORF_TEST_* schema.'; exit 0 }
 $settings = Read-OrfJson ([IO.Path]::GetFullPath($Config))
 $db = Copy-OrfValue $settings
 if ($db['schemaOrder'].Count -ne 1) { throw 'Integration config requires exactly one disposable schema' }
@@ -248,6 +248,56 @@ COMMIT;
     Invoke-OrfRestore $config $snapshot $state
     Invoke-OrfValidate $config $snapshot $state
     Assert-Integration ((Get-OrfCount $db $account "SELECT COUNT(*) FROM $($f.Settings)") -eq 0) 'Repeated allRows delete kept a new row'
+}
+Test-Integration 'Scoped unique keys and nonunique group operations' {
+    param($f)
+    $names=@{}
+    foreach ($kind in @('R','I','U','D','B')) {
+        $table=$f.Parent+'_'+$kind; $names[$kind]=$table
+        Invoke-FixtureSql "CREATE TABLE $table (ID NUMBER, V VARCHAR2(100));"
+        $f.Created += $table
+        Invoke-FixtureSql "INSERT INTO $table VALUES (1,'original');`nINSERT INTO $table VALUES (2,'a');`nINSERT INTO $table VALUES (2,'b');`nINSERT INTO $table VALUES (NULL,'null key');`nCOMMIT;"
+    }
+    $steps=@(
+        @{type='restoreRows';table=$names.R;key=@('ID');match=@(@{ID=1});columns=@('V')},
+        @{type='insert';table=$names.I;key=@('ID');match=@(@{ID=1})},
+        @{type='update';table=$names.U;key=@('ID');match=@(@{ID=2},@{ID=$null});set=@{V='updated'}},
+        @{type='delete';table=$names.D;key=@('ID');match=@(@{ID=2},@{ID=$null})},
+        @{type='backupTable';table=$names.B;key=@('ID');match=@(@{ID=2},@{ID=$null})})
+    $configPath=Join-Path $f.Root "config/schemas/$user.json"
+    Write-OrfText $configPath (ConvertTo-OrfJson @{steps=$steps})
+    $config=Get-OrfConfiguration $f.Root
+    $path=Invoke-OrfCapture $config; $snapshot=Read-OrfSnapshot $path $config
+    $state=Join-Path (Split-Path -Parent $path) 'restore-plan.json'
+    $csv=@(Import-Csv -LiteralPath (Join-Path (Split-Path -Parent $path) "$user/$($names.B).csv"))
+    Assert-Integration ($csv.Count -eq 3) 'Nonunique backup lost rows'
+    Invoke-FixtureSql "UPDATE $($names.R) SET V='refreshed' WHERE ID=1;`nDELETE FROM $($names.I) WHERE ID=1;`nCOMMIT;"
+    for ($run=0; $run -lt 2; $run++) {
+        Invoke-OrfRestore $config $snapshot $state
+        Invoke-OrfValidate $config $snapshot $state
+    }
+    Assert-Integration ((Get-OrfCount $db $account "SELECT COUNT(*) FROM $($names.U) WHERE V='updated'") -eq 3) 'UPDATE did not change every matching row'
+    Assert-Integration ((Get-OrfCount $db $account "SELECT COUNT(*) FROM $($names.D)") -eq 1) 'DELETE did not remove every matching row'
+    foreach ($kind in @('R','I')) {
+        Assert-Integration ((Get-OrfCount $db $account "SELECT COUNT(*) FROM $($names[$kind]) WHERE ID=1 AND V='original'") -eq 1) 'Selected unique key was not restored'
+        Assert-Integration ((Get-OrfCount $db $account "SELECT COUNT(*) FROM $($names[$kind]) WHERE ID=2") -eq 2) 'Unselected duplicates changed'
+    }
+    Invoke-FixtureSql "INSERT INTO $($names.U) VALUES (2,'extra');`nCOMMIT;"
+    $caught=$false
+    try { $null=Invoke-OrfPreflight $config $snapshot $state } catch { $caught=$true; Assert-Integration ($_.Exception.Message -match 'group count changed') 'Wrong changed-group error' }
+    Assert-Integration $caught 'Changed UPDATE group was accepted'
+    Invoke-FixtureSql "DELETE FROM $($names.U) WHERE V='extra';`nINSERT INTO $($names.R) VALUES (1,'duplicate');`nCOMMIT;"
+    $caught=$false
+    try { $null=Invoke-OrfPreflight $config $snapshot $state } catch { $caught=$true }
+    Assert-Integration $caught 'Duplicate selected restore key accepted'
+    $caught=$false
+    try { $null=Invoke-OrfCapture $config } catch { $caught=$true; Assert-Integration ($_.Exception.Message -match 'unique and non-null') 'Wrong selected-key error' }
+    Assert-Integration $caught 'Capture accepted duplicate selected key'
+    $all=@{type='restoreRows';table=$names.I;key=@('ID');allRows=$true;columns=@('V')}
+    Write-OrfText $configPath (ConvertTo-OrfJson @{steps=@($all)})
+    $caught=$false
+    try { $null=Invoke-OrfCapture (Get-OrfConfiguration $f.Root) } catch { $caught=$true; Assert-Integration ($_.Exception.Message -match 'unique and non-null') 'Wrong allRows key error' }
+    Assert-Integration $caught 'AllRows accepted duplicate/null keys'
 }
 if ($script:IntegrationCount -eq 0) { throw 'No integration scenario matched' }
 if ($script:IntegrationFailures.Count -gt 0) { throw "$($script:IntegrationFailures.Count) integration failures" }

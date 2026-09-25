@@ -32,10 +32,18 @@ Get-Command sqlplus.exe
 
 Pro přímé připojení zadejte `host` (server nebo IP), `port` a `serviceName`. Vynechaný port má výchozí hodnotu 1521. Service name je název služby používaný při připojení, nikoli název uživatele. SQL*Plus dostane adresu ve tvaru `//host:port/serviceName`.
 
-Pokud používáte existující TNS alias, stačí místo těchto tří polí:
+Příklad kompletní konfigurace pro existující TNS alias:
 
 ```json
-"host": "TESTDB"
+{
+  "host": "TESTDB",
+  "sqlplusPath": "sqlplus.exe",
+  "timeoutSeconds": 300,
+  "schemaOrder": ["APP1"],
+  "users": {
+    "APP1": {"username": "APP1", "password": "DOPLNTE_HESLO"}
+  }
+}
 ```
 
 U TNS aliasu neuvádějte `port` ani `serviceName`: ty se načtou z nastavení Oracle klienta. `host` přijímá také kompletní adresu `server:1521/service` nebo `//server:1521/service` bez samostatného portu/služby. Samotný název serveru bez služby se vyhodnocuje jako připojovací alias Oracle klienta. `sqlplusPath` může být plná cesta k `sqlplus.exe`; při vynechání se použije `sqlplus.exe` z PATH. Volitelný `timeoutSeconds` má výchozí hodnotu 300.
@@ -48,7 +56,7 @@ Při přechodu ze dvou souborů přesuňte objekt `users` z `credentials.json` d
 
 ## Kroky ve schématu
 
-Každý soubor obsahuje neprázdné pole `steps`. Kompletní vzory všech variant jsou v [CONFIG_EXAMPLES.md](CONFIG_EXAMPLES.md).
+Každý soubor obsahuje neprázdné pole `steps`. Kompletní vzory všech variant jsou níže v tomto dokumentu.
 
 ```json
 {
@@ -65,8 +73,8 @@ Všechny `replaceTable` se nejprve mažou v opačném pořadí konfigurace (i be
 
 - Vždy zadejte právě jedno z `match` nebo `"allRows": true`. Chybějící výběr, prázdné `match`, `allRows: false` i kombinace obou polí jsou chybou.
 - `match` je neprázdné pole objektů. Každý objekt obsahuje přesně sloupce z `key`. Sloupce uvnitř objektu jsou spojené AND, objekty OR. Opakovaná podmínka nevybere řádek vícekrát.
-- Kde je `match`, je povinný explicitní `key`. Primární klíč se nikdy automaticky nezjišťuje. Zadaný klíč musí být jedinečný a neprázdný v tabulce; může být složený a nemusí mít databázový constraint.
-- `match` vybírá konkrétní identity řádků, nikoli obecné podmínky nad jinými sloupci. Hodnoty klíčů nesmějí být `null` ani prázdný řetězec. Volné SQL, LIKE, rozsahy ani jiné operátory nejsou podporovány.
+- Kde je `match`, je povinný explicitní `key`. Primární klíč se nikdy automaticky nezjišťuje. U `restoreRows` a `insert` identifikuje jeden řádek a musí být jedinečný a neprázdný ve vybraných datech. U `update`, `delete` a `backupTable` určuje sloupce podmínky a může odpovídat libovolnému počtu řádků. Může být složený; databázový constraint není potřeba.
+- `match` obsahuje hodnoty sloupců uvedených v `key`. U `update`, `delete` a `backupTable` jsou povoleny i `null` a prázdný řetězec (Oracle `IS NULL`). U `restoreRows` a `insert` jsou prázdné a NULL klíče zakázané. Volné SQL, LIKE, rozsahy ani jiné operátory nejsou podporovány.
 - Nulový výběr je platný. Počty se vypisují do logu. Pole `keyValues`, `maxRows`, `backupMaxRows`, `maxInsertRows`, `maxDeleteRows` a `expectedRows` byla odstraněna a při načtení vyvolají chybu. Neznámá pole kroků se také odmítají.
 - Hodnoty sloupců jsou řetězce, čísla nebo `null`; boolean používejte pouze pro `allRows`. Názvy tabulek a sloupců se normalizují na velká písmena; quoted identifiers nejsou podporovány.
 
@@ -77,7 +85,7 @@ Všechny `replaceTable` se nejprve mažou v opačném pořadí konfigurace (i be
 | `replaceTable` | Pouze `allRows` | Nepoužívá | — | Smaže celý aktuální obsah a vloží celý zachycený obsah. |
 | `insert` | `match` nebo `allRows` | Vždy | — | Vloží chybějící zachycené řádky, shodné přeskočí; stejný klíč s jinými hodnotami je konflikt. |
 | `update` | `match` nebo `allRows` | Vždy | `set` | Nastaví pevné hodnoty řádkům vybraným po refreshi; klíče uloží do plánu pro opakování. |
-| `delete` | `match` nebo `allRows` | Jen s `match` | — | Smaže konkrétní klíče, nebo celý aktuální obsah tabulky. |
+| `delete` | `match` nebo `allRows` | Jen s `match` | — | Smaže všechny řádky odpovídající podmínce, nebo celý aktuální obsah tabulky. |
 
 U `backupTable`, `replaceTable` a `delete` s `allRows` se `key` neuvádí a nástroj jej odmítá jako nepoužívaný. `columns` patří pouze k `restoreRows`, `set` pouze k `update`. Klíčové sloupce nesmějí být v `columns` ani `set`.
 
@@ -87,11 +95,326 @@ U `backupTable`, `replaceTable` a `delete` s `allRows` se `key` neuvádí a nás
 
 `insert` zachytí všechny podporované uložené sloupce vybraných řádků. Pro navázané INSERT kroky uveďte rodiče před dětmi. Identity a neviditelné sloupce se u `insert` a `replaceTable` odmítají; virtuální sloupce se nevkládají.
 
+### Rozsah kontroly a opakování UPDATE
+
+Při Capture se u `restoreRows` a `insert` kontroluje unikátnost jen v rozsahu `match`; s `allRows` v celé tabulce. Duplicity a NULL mimo výběr nic neblokují. Při obnově se kontrolují pouze zachycené identity, nikoli nesouvisející řádky po refreshi. `backupTable`, `update` a `delete` unikátnost nevyžadují.
+
+UPDATE uloží po refreshi do plánu hodnoty sloupců `key` i jejich násobnost. Jedna kombinace může představovat několik řádků: všechny dostanou stejné hodnoty `set`. Při opakování a validaci se ověřuje původní počet řádků každé skupiny, ne požadavek jednoho řádku. Změna počtu vyvolá chybu a při transakci rollback. Nejde o uživatelský limit `expectedRows`, ale o kontrolu neměnnosti naplánované skupiny. Řádky uvnitř skupiny se nerozlišují; výměnu řádku za jiný se stejnými hodnotami `key` a stejným počtem nelze odhalit. Zápisy aplikací proto musí zůstat zastavené.
+
+Sloupce `key` UPDATE nesmí měnit v `set`. Více UPDATE může pracovat se stejnou tabulkou a stejným seznamem `key`, pokud jejich vybrané skupiny nekolidují. DELETE s `match` vždy smaže všechny aktuálně odpovídající řádky; nulový počet je platný.
+
 ### Přechod ze staré konfigurace
 
-Odstraňte všechna početní omezení. Nahraďte `keyValues` polem pojmenovaných objektů `match`, například `"match": [{"ID": 101}]`. Původní objekt `match` zabalte do pole a zajistěte, že obsahuje přesně sloupce explicitního klíče. Obecný filtr nad neunikátními sloupci nelze automaticky převést: vyberte konkrétní klíče. Pro celé tabulky přidejte `"allRows": true`.
+Odstraňte všechna početní omezení. Nahraďte `keyValues` polem pojmenovaných objektů `match`, například `"match": [{"ID": 101}]`. Původní objekt `match` zabalte do pole a zajistěte, že obsahuje přesně sloupce explicitního klíče. U UPDATE/DELETE/zálohy může být filtr neunikátní. U `restoreRows` a `insert` musí identifikovat nejvýše jeden řádek pro každou kombinaci. Pro celé tabulky přidejte `"allRows": true`.
 
 Nový formát vyžaduje nový Capture před refreshem. Staré snapshoty se neobnovují novou verzí.
+
+## Vzorové konfigurace operací
+
+Každý následující blok je samostatný obsah `config/schemas/APP1.json`. Názvy a hodnoty přizpůsobte databázi. Kroky pro různé tabulky můžete spojit do jednoho pole `steps`.
+
+### 1. Pouze záloha celé tabulky
+
+```json
+{
+  "steps": [
+    {
+      "type": "backupTable",
+      "table": "AUDIT_LOG",
+      "allRows": true
+    }
+  ]
+}
+```
+
+### 2. Záloha všech řádků odpovídajících podmínce
+
+```json
+{
+  "steps": [
+    {
+      "type": "backupTable",
+      "table": "AUDIT_LOG",
+      "key": [
+        "CONFIGTYPE"
+      ],
+      "match": [
+        {
+          "CONFIGTYPE": "POA_CONFIG"
+        },
+        {
+          "CONFIGTYPE": "BMI"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 3. Obnova sloupců konkrétních řádků
+
+```json
+{
+  "steps": [
+    {
+      "type": "restoreRows",
+      "table": "CONFIG",
+      "key": [
+        "CONFIG_KEY"
+      ],
+      "match": [
+        {
+          "CONFIG_KEY": "API_URL"
+        },
+        {
+          "CONFIG_KEY": "CALLBACK_URL"
+        }
+      ],
+      "columns": [
+        "CONFIG_VALUE",
+        "DESCRIPTION"
+      ]
+    }
+  ]
+}
+```
+
+### 4. Obnova sloupců všech původních řádků
+
+```json
+{
+  "steps": [
+    {
+      "type": "restoreRows",
+      "table": "CONFIG",
+      "key": [
+        "CONFIG_KEY"
+      ],
+      "allRows": true,
+      "columns": [
+        "CONFIG_VALUE",
+        "DESCRIPTION"
+      ]
+    }
+  ]
+}
+```
+
+### 5. Obnova podle složeného klíče
+
+```json
+{
+  "steps": [
+    {
+      "type": "restoreRows",
+      "table": "TENANT_CONFIG",
+      "key": [
+        "TENANT_ID",
+        "CONFIG_KEY"
+      ],
+      "match": [
+        {
+          "TENANT_ID": 10,
+          "CONFIG_KEY": "API_URL"
+        },
+        {
+          "TENANT_ID": 20,
+          "CONFIG_KEY": "API_URL"
+        }
+      ],
+      "columns": [
+        "CONFIG_VALUE",
+        "DESCRIPTION"
+      ]
+    }
+  ]
+}
+```
+
+### 6. Nahrazení celého obsahu tabulky
+
+```json
+{
+  "steps": [
+    {
+      "type": "replaceTable",
+      "table": "LOOKUP",
+      "allRows": true
+    }
+  ]
+}
+```
+
+### 7. Nahrazení navázaných tabulek
+
+```json
+{
+  "steps": [
+    {
+      "type": "replaceTable",
+      "table": "USERS",
+      "allRows": true
+    },
+    {
+      "type": "replaceTable",
+      "table": "USERGROUPS",
+      "allRows": true
+    }
+  ]
+}
+```
+
+### 8. Doplnění konkrétních zachycených řádků
+
+```json
+{
+  "steps": [
+    {
+      "type": "insert",
+      "table": "CONFIG",
+      "key": [
+        "CONFIG_KEY"
+      ],
+      "match": [
+        {
+          "CONFIG_KEY": "API_URL"
+        },
+        {
+          "CONFIG_KEY": "CALLBACK_URL"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 9. Doplnění všech původních řádků
+
+```json
+{
+  "steps": [
+    {
+      "type": "insert",
+      "table": "TEST_USERS",
+      "key": [
+        "USER_ID"
+      ],
+      "allRows": true
+    }
+  ]
+}
+```
+
+### 10. Nastavení hodnot konkrétnímu řádku
+
+```json
+{
+  "steps": [
+    {
+      "type": "update",
+      "table": "CONFIG",
+      "key": [
+        "CONFIG_KEY"
+      ],
+      "match": [
+        {
+          "CONFIG_KEY": "API_URL"
+        }
+      ],
+      "set": {
+        "CONFIG_VALUE": "https://api-test.example.cz",
+        "DESCRIPTION": "Testovací API"
+      }
+    }
+  ]
+}
+```
+
+### 11. Stejné hodnoty více řádkům podle prostředí
+
+```json
+{
+  "steps": [
+    {
+      "type": "update",
+      "table": "INTEGRATIONS",
+      "key": [
+        "ENVIRONMENT"
+      ],
+      "match": [
+        {
+          "ENVIRONMENT": "PROD"
+        },
+        {
+          "ENVIRONMENT": "STAGING"
+        }
+      ],
+      "set": {
+        "ENABLED": 0
+      }
+    }
+  ]
+}
+```
+
+### 12. Nastavení hodnot všem řádkům
+
+```json
+{
+  "steps": [
+    {
+      "type": "update",
+      "table": "NOTIFICATION_SETTINGS",
+      "key": [
+        "ID"
+      ],
+      "allRows": true,
+      "set": {
+        "ENABLED": 0,
+        "RECIPIENT_EMAIL": null
+      }
+    }
+  ]
+}
+```
+
+### 13. Smazání všech řádků odpovídajících podmínce
+
+```json
+{
+  "steps": [
+    {
+      "type": "delete",
+      "table": "TEMP_MESSAGES",
+      "key": [
+        "SOURCE", "STATUS"
+      ],
+      "match": [
+        {
+          "SOURCE": "PROD", "STATUS": "PENDING"
+        },
+        {
+          "SOURCE": "PROD", "STATUS": "ERROR"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 14. Smazání všech řádků
+
+```json
+{
+  "steps": [
+    {
+      "type": "delete",
+      "table": "TEMP_MESSAGES",
+      "allRows": true
+    }
+  ]
+}
+```
 
 ## Provozní postup
 
@@ -156,7 +479,7 @@ Před `CAPTURE SUCCESS` se snapshot i exporty znovu načtou a porovnají se zach
 
 Podporované typy: CHAR, VARCHAR2, NCHAR, NVARCHAR2, NUMBER, DATE, TIMESTAMP a TIMESTAMP WITH TIME ZONE. NUMBER se ukládá jako text, aby se neztratila přesnost. DATE očekává `YYYY-MM-DD HH24:MI:SS`, TIMESTAMP přidává devět desetinných míst a časová zóna offset `+HH:MM`. U časové zóny se zachovává offset, nikoli název regionu. Nepodporované typy, například CLOB/BLOB/RAW a TIMESTAMP WITH LOCAL TIME ZONE, nebo příliš velký JSON řádek způsobí chybu capture. SQL*Plus komunikuje v UTF-8; víceřádkové řetězce se převádějí na bezpečné výrazy s CHR/NCHR.
 
-PowerShell vytváří **snapshoty verze 4** pro nový formát konfigurace. Snapshoty verzí 1/2/3 a jejich restore plány se odmítají. Při přechodu upravte konfiguraci a proveďte nový Capture **před** refreshem. Pokud refresh už proběhl a máte jen starý snapshot, dokončete obnovu původní verzí nástroje; snapshot ručně nepřevádějte.
+PowerShell vytváří **snapshoty verze 5** pro nový formát konfigurace. Snapshoty verzí 1/2/3/4 a jejich restore plány se odmítají. Při přechodu upravte konfiguraci a proveďte nový Capture **před** refreshem. Pokud refresh už proběhl a máte jen starý snapshot, dokončete obnovu původní verzí nástroje; snapshot ručně nepřevádějte.
 
 Soubory `.ps1` jsou uložené jako UTF-8 s BOM kvůli Windows PowerShellu 5.1. JSON a SQL exporty používají UTF-8 bez BOM, CSV UTF-8 s BOM. Přenos do SQL*Plus používá explicitní UTF-8 bajty přes .NET proces, současně se čtou stdout i stderr a hlídá se `timeoutSeconds`. Není závislý na kódové stránce konzole. Velká přesná čísla v konfiguraci zapište jako JSON řetězce; NUMBER načtený z Oracle se vždy uchovává jako text.
 

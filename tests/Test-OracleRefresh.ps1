@@ -37,7 +37,7 @@ function New-TestSnapshot($Config) {
         $step['types'] = [ordered]@{ ID='NUMBER'; V='VARCHAR2' }
         if ($step['type'] -in @('replaceTable','restoreRows','insert')) { $step['rows'] = @([ordered]@{ ID='1'; V='original' }) }
     }
-    return [ordered]@{ version=4; status='SUCCESS'; configHash=$Config.Hash; schemas=@([ordered]@{ username='APP'; definition=(Copy-OrfValue $Config.Schemas[0]['steps']); layouts=$layouts; steps=$steps }) }
+    return [ordered]@{ version=5; status='SUCCESS'; configHash=$Config.Hash; schemas=@([ordered]@{ username='APP'; definition=(Copy-OrfValue $Config.Schemas[0]['steps']); layouts=$layouts; steps=$steps }) }
 }
 
 try {
@@ -181,11 +181,13 @@ try {
         Assert-Throws { $null = New-TestConfig @(@{type='replaceTable';allRows=$true;table='T'},@{type='delete';table='T';key=@('ID');match=@(@{ID=1})}) } 'Conflicting'
     }
     Test-Case 'Every documented JSON example loads with the new format' {
-        $doc=[IO.File]::ReadAllText((Join-Path $PSScriptRoot '../CONFIG_EXAMPLES.md'))
+        $doc=[IO.File]::ReadAllText((Join-Path $PSScriptRoot '../README.md'))
         $blocks=[regex]::Matches($doc,'(?s)```json\s*(.*?)\s*```')
-        Assert-Equal $blocks.Count 14
+        Assert-True ($blocks.Count -ge 14)
         foreach ($block in $blocks) {
-            $example=ConvertFrom-OrfJson $block.Groups[1].Value
+            $json=$block.Groups[1].Value
+            if ($json -notmatch '"steps"') { continue }
+            $example=ConvertFrom-OrfJson $json
             $null=New-TestConfig $example['steps']
         }
     }
@@ -235,19 +237,60 @@ try {
         $sql=Get-OrfRestoreSql $s['schemas'][0] @{updates=@{}} $true
         Assert-True (-not $sql.Contains('UPDATE R SET')); Assert-True ($sql.Contains('INSERT INTO I'))
     }
-    Test-Case 'Duplicate and null explicit keys fail capture and delete preflight' {
+    Test-Case 'Duplicate and null identity keys fail capture' {
         function Get-OrfLayout { New-TestLayout }
         function Get-OrfCount($Db,$Account,$Query) {
             if ($Query.Contains('GROUP BY')) { return 1 }; return 0
         }
         function Get-OrfRows { return ,@() }
-        foreach ($kind in @('restoreRows','insert','update','delete','backupTable')) {
+        foreach ($kind in @('restoreRows','insert')) {
             $step=@{type=$kind;table='T';key=@('ID');match=@(@{ID=1})}
             if ($kind -eq 'restoreRows') { $step['columns']=@('V') }
             if ($kind -eq 'update') { $step['set']=@{V='new'} }
             $c=New-TestConfig @($step)
             Assert-Throws { Invoke-OrfCapture $c } 'unique and non-null'
-            if ($kind -eq 'delete') { Assert-Throws { Invoke-OrfPreflight $c (New-TestSnapshot $c) } 'unique and non-null' }
+        }
+    }
+    Test-Case 'Uniqueness query is scoped to match and allRows checks whole table' {
+        function Get-OrfCount($Db,$Account,$Query) {
+            Assert-True ($Query.Contains('WHERE ((ID = 1)) GROUP BY ID'))
+            return 0
+        }
+        Assert-OrfKeys @{} @{} @{table='T';key=@('ID');match=@(@{ID=1})} @{ID='NUMBER'}
+        function Get-OrfCount($Db,$Account,$Query) {
+            Assert-True ($Query.Contains('WHERE 1=1 GROUP BY ID'))
+            return 1
+        }
+        Assert-Throws { Assert-OrfKeys @{} @{} @{table='T';key=@('ID');allRows=$true} @{ID='NUMBER'} } 'T: selected keys'
+    }
+    Test-Case 'Nonunique UPDATE groups execute once and validate their multiplicity' {
+        function Get-OrfLayout { New-TestLayout }; function Get-OrfCount { 0 }; function Invoke-OrfSqlPlus { '' }
+        function Get-OrfRows { return ,@([ordered]@{ID='2'},[ordered]@{ID='2'},[ordered]@{ID=$null}) }
+        $c=New-TestConfig @(@{type='update';table='T';key=@('ID');match=@(@{ID=2},@{ID=$null});set=@{V='new'}})
+        $s=New-TestSnapshot $c; $plan=Invoke-OrfPreflight $c $s
+        $sql=Get-OrfRestoreSql $s['schemas'][0] $plan['schemas'][0] $true
+        Assert-Equal ([regex]::Matches($sql,'UPDATE T SET').Count) 2
+        Assert-True ($sql.Contains('SQL%ROWCOUNT <> 2'))
+        Assert-True ($sql.Contains('WHERE ID IS NULL;'))
+        Assert-True ($sql.Contains("WHERE ID = 2 AND V = ('new')"))
+        $state=Join-Path $c.Root 'restore-plan.json'; Write-OrfPlan $state $plan
+        function Get-OrfCount($Db,$Account,$Query) {
+            if ($Query -like '*FROM T WHERE ID = 2') { return 2 }
+            if ($Query -like '*FROM T WHERE ID IS NULL') { return 1 }
+            return 0
+        }
+        $null=Invoke-OrfPreflight $c $s $state
+        function Get-OrfCount { 0 }
+        Assert-Throws { Invoke-OrfPreflight $c $s $state } 'group count changed'
+    }
+    Test-Case 'Backup UPDATE and DELETE capture never require unique selection columns' {
+        function Get-OrfLayout { New-TestLayout }
+        function Get-OrfCount { throw 'Unexpected uniqueness check' }
+        function Get-OrfRows { return ,@(@{ID='2';V='a'},@{ID='2';V='b'},@{ID=$null;V='c'}) }
+        foreach ($kind in @('backupTable','update','delete')) {
+            $step=@{type=$kind;table='T';key=@('ID');match=@(@{ID=2},@{ID=$null})}
+            if ($kind -eq 'update') { $step['set']=@{V='new'} }
+            $c=New-TestConfig @($step); $null=Invoke-OrfCapture $c
         }
     }
     Test-Case 'SQL literal handles Czech, apostrophes, ampersand, slash, CRLF and emoji' {
@@ -364,9 +407,9 @@ try {
     }
     Test-Case 'All old snapshot versions rejected before database work' {
         $c = New-TestConfig @(@{type='replaceTable';allRows=$true;table='T'}); $snap = New-TestSnapshot $c
-        foreach ($version in @(1,2,3)) {
+        foreach ($version in @(1,2,3,4)) {
             $snap['version']=$version; Write-OrfSnapshot $c.Root $snap
-            Assert-Throws { Read-OrfSnapshot (Join-Path $c.Root 'snapshot.json') $c } 'version 4'
+            Assert-Throws { Read-OrfSnapshot (Join-Path $c.Root 'snapshot.json') $c } 'version 5'
         }
     }
     Test-Case 'Changing configuration invalidates an existing snapshot' {
@@ -518,7 +561,7 @@ try {
         Assert-True ($restoreSql.Contains("SQL%ROWCOUNT = 0 THEN DBMS_OUTPUT.PUT_LINE('ORF_SKIP|0|0')"))
     }
     Test-Case 'UPDATE stable keys persisted before failure and reused on retry' {
-        function Get-OrfLayout { New-TestLayout }; function Get-OrfCount { 0 }
+        function Get-OrfLayout { New-TestLayout }; function Get-OrfCount($Db,$Account,$Query) { if ($Query -like '*FROM T WHERE ID = 42') { return 1 }; return 0 }
         function Get-OrfRows { return ,@([ordered]@{ID='42'}) }
         $c = New-TestConfig @(@{type='update';table='T';key=@('ID');match=@(@{ID=42});set=@{V='TEST'}})
         $s=New-TestSnapshot $c; $state=Join-Path $c.Root 'restore-plan.json'

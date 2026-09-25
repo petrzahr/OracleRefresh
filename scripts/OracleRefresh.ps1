@@ -174,7 +174,7 @@ function Get-OrfConfiguration([string]$ProjectRoot) {
                     if ($item.Count -ne $step['key'].Count) { throw 'Each match must contain exactly the key columns' }
                     foreach ($col in $step['key']) {
                         if (-not $item.Contains($col)) { throw 'Each match must contain exactly the key columns' }
-                        if ($null -eq $item[$col] -or ($item[$col] -is [string] -and $item[$col].Length -eq 0)) { throw 'Match key values must be non-null and nonempty' }
+                        if ($kind -in @('restoreRows','insert') -and ($null -eq $item[$col] -or ($item[$col] -is [string] -and $item[$col].Length -eq 0))) { throw 'Match key values must be non-null and nonempty' }
                     }
                     $item = Select-OrfMap $item $step['key']
                     $digest = Get-OrfDigest $item
@@ -396,9 +396,10 @@ function Get-OrfCount($Db, $Account, [string]$Query) {
     return $values[0]
 }
 
-function Assert-OrfKeys($Db, $Account, $Step) {
+function Assert-OrfKeys($Db, $Account, $Step, $Types) {
     $keys = $Step['key']; $nulls = @($keys | ForEach-Object { "$_ IS NULL" }) -join ' OR '
-    if ((Get-OrfCount $Db $Account "SELECT COUNT(*) FROM (SELECT $($keys -join ', ') FROM $($Step['table']) GROUP BY $($keys -join ', ') HAVING COUNT(*) > 1 OR $nulls)") -ne 0) { throw 'Stable keys must be unique and non-null' }
+    $where = Get-OrfSelection $Step $Types
+    if ((Get-OrfCount $Db $Account "SELECT COUNT(*) FROM (SELECT $($keys -join ', ') FROM $($Step['table']) WHERE $where GROUP BY $($keys -join ', ') HAVING COUNT(*) > 1 OR $nulls)") -ne 0) { throw "$($Step['table']): selected keys must be unique and non-null" }
 }
 
 function Get-OrfSelection($Step, $Types) {
@@ -480,7 +481,7 @@ function Read-OrfSnapshot([string]$Path, $Configuration) {
     $expected = [IO.File]::ReadAllText((Join-Path $directory 'snapshot.sha256')).Trim()
     if ((Get-OrfHash ([IO.File]::ReadAllBytes($Path))) -cne $expected) { throw 'Snapshot checksum mismatch' }
     $snapshot = Read-OrfJson $Path
-    if ($snapshot['version'] -ne 4) { throw 'PowerShell requires a new version 4 capture before DBA refresh; old snapshots cannot be used' }
+    if ($snapshot['version'] -ne 5) { throw 'PowerShell requires a new version 5 capture before DBA refresh; old snapshots cannot be used' }
     if ($snapshot['status'] -cne 'SUCCESS' -or $snapshot['configHash'] -cne $Configuration.Hash) { throw 'Incomplete snapshot or changed configuration' }
     if ($snapshot['schemas'].Count -ne $Configuration.Schemas.Count) { throw 'Snapshot schema count mismatch' }
     for ($i=0; $i -lt $Configuration.Schemas.Count; $i++) {
@@ -527,7 +528,7 @@ function Invoke-OrfCapture($Configuration) {
     $directory = Join-Path $Configuration.Root ('snapshots/' + $stamp)
     if (Test-Path -LiteralPath $directory) { throw 'Snapshot directory already exists' }
     [void][IO.Directory]::CreateDirectory($directory)
-    $snapshot = [ordered]@{ version=4; capturedAt=$stamp; configHash=$Configuration.Hash; status='INCOMPLETE'; schemas=@() }
+    $snapshot = [ordered]@{ version=5; capturedAt=$stamp; configHash=$Configuration.Hash; status='INCOMPLETE'; schemas=@() }
     $inventory = @(); $manifest = @(); $db = $Configuration.Database
     try {
         foreach ($cfg in $Configuration.Schemas) {
@@ -558,7 +559,7 @@ function Invoke-OrfCapture($Configuration) {
                 $types = $cache[$table].Types; $rows = $cache[$table].Rows
                 if ($step.Contains('key')) {
                     $null = Select-OrfMap $types $step['key']
-                    Assert-OrfKeys $db $cfg $step
+                    if ($kind -in @('restoreRows','insert')) { Assert-OrfKeys $db $cfg $step $types }
                 }
                 switch ($kind) {
                     'backupTable' { }
@@ -686,7 +687,6 @@ function Invoke-OrfPreflight($Configuration, $Snapshot, [string]$StatePath='') {
             }
             if ($kind -eq 'insert') {
                 foreach ($col in $layout.Values) { if ($col['identity'] -eq 'YES' -or $col['hidden'] -eq 'YES') { throw "$table insert does not support identity/invisible columns" } }
-                Assert-OrfKeys $db $cfg $step
                 $null = Invoke-OrfSqlPlus $db $cfg ("DECLARE v_count NUMBER; BEGIN`n" + (Get-OrfInsertChecks $step -AllowMissing) + "`nNULL; END;`n/`n")
             }
             if ($kind -eq 'restoreRows' -or $kind -eq 'update') {
@@ -694,25 +694,25 @@ function Invoke-OrfPreflight($Configuration, $Snapshot, [string]$StatePath='') {
                 foreach ($column in $columns) { if ($layout[$column]['identity'] -eq 'YES' -or $layout[$column]['virtual'] -eq 'YES') { throw 'Cannot update identity or virtual columns' } }
             }
             if ($kind -eq 'restoreRows') {
-                Assert-OrfKeys $db $cfg $step
                 $tuples = @(); foreach ($row in $step['rows']) { $tuples += ,@($step['key'] | ForEach-Object { $row[$_] }) }
                 $null = Get-OrfSelectedRows $db $cfg $step $step['types'] $tuples -AllowMissing
             }
-            if ($kind -eq 'delete' -and -not $step['allRows']) { Assert-OrfKeys $db $cfg $step }
             if ($kind -ne 'update') { continue }
-            Assert-OrfKeys $db $cfg $step
             $null = Invoke-OrfSqlPlus $db $cfg ("DECLARE v_count NUMBER; BEGIN`n" + (Get-OrfValueChecks $step $layout) + "`nEND;`n/`n")
             if ($null -ne $previous) {
                 if (-not $schemaPlan['updates'].Contains([string]$index)) { throw 'Missing UPDATE restore plan' }
-                $rows = $schemaPlan['updates'][[string]$index]['rows']; $tuples = @()
-                foreach ($row in $rows) { $tuples += ,@($step['key'] | ForEach-Object { $row[$_] }) }
-                $null = Get-OrfSelectedRows $db $cfg $step (Select-OrfMap $step['types'] $step['key']) $tuples
+                $rows = $schemaPlan['updates'][[string]$index]['rows']
+                foreach ($group in (Get-OrfRowGroups $rows)) {
+                    $where = Get-OrfPredicate $group.Row $step['types']
+                    if ((Get-OrfCount $db $cfg "SELECT COUNT(*) FROM $table WHERE $where") -ne $group.Count) { throw "$table UPDATE group count changed" }
+                }
             } else {
                 $where = Get-OrfSelection $step $step['types']
                 $rows = Get-OrfRows $db $cfg $table (Select-OrfMap $step['types'] $step['key']) $null $where
                 $schemaPlan['updates'][[string]$index] = [ordered]@{ rows=$rows }
             }
-            foreach ($row in $rows) {
+            foreach ($group in (Get-OrfRowGroups $rows)) {
+                $row = $group.Row
                 if (-not $used.Add($table + '|' + (ConvertTo-OrfJson $row))) { throw "$table overlapping UPDATE steps" }
                 foreach ($deletion in $entry['steps']) {
                     if ($deletion['type'] -ne 'delete' -or $deletion['table'] -ne $table) { continue }
@@ -723,7 +723,8 @@ function Invoke-OrfPreflight($Configuration, $Snapshot, [string]$StatePath='') {
                             $terms = foreach ($col in $item.Keys) {
                                 $expression = $col
                                 if ($step['set'].Contains($col)) { $expression = Get-OrfLiteral $step['set'][$col] $step['types'][$col] }
-                                "$expression = $(Get-OrfLiteral $item[$col] $deletion['types'][$col])"
+                                if ($null -eq $item[$col] -or $item[$col] -ceq '') { "$expression IS NULL" }
+                                else { "$expression = $(Get-OrfLiteral $item[$col] $deletion['types'][$col])" }
                             }
                             $alternatives += '(' + ($terms -join ' AND ') + ')'
                         }
@@ -737,6 +738,17 @@ function Invoke-OrfPreflight($Configuration, $Snapshot, [string]$StatePath='') {
     }
     Write-Host 'PREFLIGHT SUCCESS (read-only database checks)'
     return ,$plan
+}
+
+# Preserve the multiplicity of non-unique UPDATE selection values in the saved plan.
+function Get-OrfRowGroups($Rows) {
+    $groups = [ordered]@{}
+    foreach ($row in $Rows) {
+        $digest = Get-OrfDigest $row
+        if (-not $groups.Contains($digest)) { $groups[$digest] = @{ Row=$row; Count=0 } }
+        $groups[$digest].Count++
+    }
+    foreach ($group in $groups.Values) { $group }
 }
 
 function Get-OrfCountAssertion([string]$Query, [long]$Expected, [string]$Label) {
@@ -779,11 +791,14 @@ function Get-OrfValidationSql($Entry, $SchemaPlan) {
             'update' {
                 if (-not $SchemaPlan['updates'].Contains([string]$index)) { throw 'UPDATE validation requires a saved restore plan' }
                 $rows = $SchemaPlan['updates'][[string]$index]['rows']
-                foreach ($row in $rows) {
+                foreach ($group in (Get-OrfRowGroups $rows)) {
+                    $row = $group.Row
+                    $keyWhere = Get-OrfPredicate $row $types
+                    $statements += Get-OrfCountAssertion "SELECT 1 FROM $table WHERE $keyWhere" $group.Count "$table UPDATE group count changed"
                     $values = Copy-OrfValue $row
                     foreach ($key in $step['set'].Keys) { $values[$key] = $step['set'][$key] }
                     $where = Get-OrfPredicate $values $types
-                    $statements += Get-OrfCountAssertion "SELECT 1 FROM $table WHERE $where" 1 "$table UPDATE key/value mismatch"
+                    $statements += Get-OrfCountAssertion "SELECT 1 FROM $table WHERE $where" $group.Count "$table UPDATE key/value mismatch"
                 }
                 if ($step['allRows']) { $statements += Get-OrfCountAssertion "SELECT 1 FROM $table" $rows.Count "$table UPDATE table row count changed" }
             }
@@ -800,10 +815,11 @@ function Get-OrfRestoreSql($Entry, $SchemaPlan, [bool]$FirstAttempt) {
             $rows = $SchemaPlan['updates'][[string]$index]['rows']; $clause = ''
             if (-not $step['allRows']) { $clause = ' WHERE ' + (Get-OrfSelection $step $step['types']) }
             $statements += Get-OrfCountAssertion "SELECT 1 FROM $($step['table'])$clause" $rows.Count 'UPDATE selection changed since preflight'
-            foreach ($row in $rows) {
+            foreach ($group in (Get-OrfRowGroups $rows)) {
+                $row = $group.Row
                 $where = Get-OrfPredicate $row $step['types']
                 if (-not $step['allRows']) { $where += ' AND ' + (Get-OrfSelection $step $step['types']) }
-                $statements += Get-OrfCountAssertion "SELECT 1 FROM $($step['table']) WHERE $where" 1 'UPDATE key selection changed'
+                $statements += Get-OrfCountAssertion "SELECT 1 FROM $($step['table']) WHERE $where" $group.Count 'UPDATE key selection changed'
             }
         }
     }
@@ -828,21 +844,26 @@ function Get-OrfRestoreSql($Entry, $SchemaPlan, [bool]$FirstAttempt) {
                     $statements += "INSERT INTO $table ($(@($types.Keys) -join ', ')) VALUES (`n$($values -join ",`n"));"
                 }
             }
-            { $_ -in @('restoreRows','update') } {
-                $rows = $step['rows']; if ($step['type'] -eq 'update') { $rows = $SchemaPlan['updates'][[string]$index]['rows'] }
+            'update' {
+                $rows = $SchemaPlan['updates'][[string]$index]['rows']
+                $assignments = foreach ($column in $step['set'].Keys) { "$column = $(Get-OrfLiteral $step['set'][$column] $types[$column])" }
+                foreach ($group in (Get-OrfRowGroups $rows)) {
+                    $where = Get-OrfPredicate $group.Row $types
+                    $statements += "UPDATE $table SET $($assignments -join ",`n") WHERE $where;"
+                    $statements += "IF SQL%ROWCOUNT <> $($group.Count) THEN RAISE_APPLICATION_ERROR(-20014, 'UPDATE group count changed'); END IF;"
+                }
+            }
+            'restoreRows' {
+                $rows = $step['rows']
                 $rowIndex = -1
                 foreach ($row in $rows) {
                     $rowIndex++
-                    $values = $step['set']; if ($step['type'] -eq 'restoreRows') { $values = Select-OrfMap $row $step['columns'] }
+                    $values = Select-OrfMap $row $step['columns']
                     $assignments = foreach ($column in $values.Keys) { "$column = $(Get-OrfLiteral $values[$column] $types[$column])" }
                     $where = Get-OrfPredicate (Select-OrfMap $row $step['key']) $types
                     $statements += "UPDATE $table SET $($assignments -join ",`n") WHERE $where;"
-                    if ($step['type'] -eq 'restoreRows') {
-                        $statements += "IF SQL%ROWCOUNT > 1 THEN RAISE_APPLICATION_ERROR(-20014, 'Duplicate restore key'); END IF;"
-                        $statements += "IF SQL%ROWCOUNT = 0 THEN DBMS_OUTPUT.PUT_LINE('ORF_SKIP|$index|$rowIndex'); END IF;"
-                    } else {
-                        $statements += "IF SQL%ROWCOUNT <> 1 THEN RAISE_APPLICATION_ERROR(-20014, 'Missing or duplicate update key'); END IF;"
-                    }
+                    $statements += "IF SQL%ROWCOUNT > 1 THEN RAISE_APPLICATION_ERROR(-20014, 'Duplicate restore key'); END IF;"
+                    $statements += "IF SQL%ROWCOUNT = 0 THEN DBMS_OUTPUT.PUT_LINE('ORF_SKIP|$index|$rowIndex'); END IF;"
                 }
             }
             'delete' {
